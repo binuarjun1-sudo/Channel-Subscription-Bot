@@ -203,30 +203,60 @@ def request_proof(call):
     ch_data = channels_col.find_one({"channel_id": int(ch_id)})
     price = ch_data['plans'][mins]
 
-    # Stash the pending payment details in memory until the screenshot arrives
     pending_payments[user.id] = {"ch_id": int(ch_id), "mins": mins, "price": price}
 
     bot.answer_callback_query(call.id)
+
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("🔙 Cancel / Choose Another Plan", callback_data=f"cancelproof_{ch_id}"))
+
     msg = bot.send_message(call.message.chat.id,
-        "📸 Please send a screenshot of your payment as proof.\n\nJust send the photo here — it'll be forwarded to the admin for verification.")
+        "📸 Please send a screenshot of your payment as proof.\n\nJust send the photo here — it'll be forwarded to the admin for verification.",
+        reply_markup=markup)
     bot.register_next_step_handler(msg, receive_proof)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('cancelproof_'))
+def cancel_proof(call):
+    user = call.from_user
+    ch_id = int(call.data.split('_')[1])
+
+    pending_payments.pop(user.id, None)
+    bot.answer_callback_query(call.id, "Cancelled.")
+
+    ch_data = channels_col.find_one({"channel_id": ch_id})
+    if not ch_data:
+        bot.send_message(call.message.chat.id, "❌ Channel not found. Please use the link again.")
+        return
+
+    markup = InlineKeyboardMarkup()
+    for p_time, p_price in ch_data['plans'].items():
+        label = f"{p_time} Min" if int(p_time) < 60 else f"{int(p_time)//1440} Days"
+        markup.add(InlineKeyboardButton(f"💳 {label} - ₹{p_price}", callback_data=f"select_{ch_id}_{p_time}"))
+    markup.add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
+
+    bot.send_message(call.message.chat.id,
+        f"You are joining: *{ch_data['name']}*.\n\nPlease select a subscription plan below:",
+        reply_markup=markup, parse_mode="Markdown")
 
 
 def receive_proof(message):
     user = message.from_user
 
     if user.id not in pending_payments:
-        bot.send_message(message.chat.id, "⚠️ Your payment session expired or wasn't found. Please start again by selecting a plan.")
+        bot.send_message(message.chat.id, "⚠️ This payment request was cancelled or expired. Please select a plan again using the link.")
         return
 
     if not message.photo:
-        msg = bot.send_message(message.chat.id, "❌ That doesn't look like a photo. Please send a screenshot image of your payment.")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🔙 Cancel / Choose Another Plan", callback_data=f"cancelproof_{pending_payments[user.id]['ch_id']}"))
+        msg = bot.send_message(message.chat.id, "❌ That doesn't look like a photo. Please send a screenshot image of your payment.", reply_markup=markup)
         bot.register_next_step_handler(msg, receive_proof)
         return
 
     data = pending_payments.pop(user.id)
     ch_data = channels_col.find_one({"channel_id": data["ch_id"]})
-    photo_file_id = message.photo[-1].file_id  # highest resolution available
+    photo_file_id = message.photo[-1].file_id
 
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("✅ Approve", callback_data=f"app_{user.id}_{data['ch_id']}_{data['mins']}"))
