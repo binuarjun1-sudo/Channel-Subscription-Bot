@@ -97,26 +97,82 @@ def get_plans(message):
     if message.forward_from_chat:
         ch_id = message.forward_from_chat.id
         ch_name = message.forward_from_chat.title
-        msg = bot.send_message(ADMIN_ID, 
-            f"Channel Detected: *{ch_name}*\n\nEnter plans in format (Minutes:Price):\n`Min:Price, Min:Price` \n\n"
-            "Example:\n`1440:99, 43200:199` (1 Day and 30 Days)", parse_mode="Markdown")
-        bot.register_next_step_handler(msg, finalize_channel, ch_id, ch_name)
+        msg = bot.send_message(ADMIN_ID,
+            f"Channel Detected: *{ch_name}* 🔥\n\nHow many plans do you want to add? (e.g. 2)",
+            parse_mode="Markdown")
+        bot.register_next_step_handler(msg, ask_plan_count, ch_id, ch_name)
     else:
         bot.send_message(ADMIN_ID, "❌ Error: Message was not forwarded. Use /add to try again.")
 
-def finalize_channel(message, ch_id, ch_name):
-    try:
-        raw_plans = message.text.split(',')
-        plans_dict = {}
-        for p in raw_plans:
-            t, pr = p.strip().split(':')
-            plans_dict[t] = pr
-        
-        channels_col.update_one({"channel_id": ch_id}, {"$set": {"name": ch_name, "plans": plans_dict, "admin_id": ADMIN_ID}}, upsert=True)
-        bot_username = bot.get_me().username
-        bot.send_message(ADMIN_ID, f"✅ Setup Successful!\n\nInvite Link for users:\n`https://t.me/{bot_username}?start={ch_id}`", parse_mode="Markdown")
-    except:
-        bot.send_message(ADMIN_ID, "❌ Invalid format. Please use `Min:Price, Min:Price`. Use /add to retry.")
+def ask_plan_count(message, ch_id, ch_name):
+    text = message.text.strip()
+    if not text.isdigit() or int(text) < 1:
+        msg = bot.send_message(ADMIN_ID, "❌ Please send a valid number (e.g. 2). How many plans do you want to add?")
+        bot.register_next_step_handler(msg, ask_plan_count, ch_id, ch_name)
+        return
+
+    plan_state = {
+        "ch_id": ch_id,
+        "ch_name": ch_name,
+        "total": int(text),
+        "current": 1,
+        "plans": {}
+    }
+    ask_minutes(message, plan_state)
+
+def ask_minutes(message, plan_state):
+    msg = bot.send_message(ADMIN_ID,
+        f"Plan {plan_state['current']}/{plan_state['total']}\n\nEnter duration in MINUTES (e.g. 1440 for 1 Day, 43200 for 30 Days):")
+    bot.register_next_step_handler(msg, save_minutes, plan_state)
+
+def save_minutes(message, plan_state):
+    text = message.text.strip()
+    if not text.isdigit() or int(text) < 1:
+        msg = bot.send_message(ADMIN_ID, "❌ Please send a valid number of minutes (numbers only, e.g. 1440).")
+        bot.register_next_step_handler(msg, save_minutes, plan_state)
+        return
+
+    plan_state["temp_minutes"] = text
+    msg = bot.send_message(ADMIN_ID, f"Got it: {text} minutes.\n\nNow enter the PRICE for this plan (numbers only, e.g. 99):")
+    bot.register_next_step_handler(msg, save_price, plan_state)
+
+def save_price(message, plan_state):
+    text = message.text.strip()
+    if not text.isdigit() or int(text) < 1:
+        msg = bot.send_message(ADMIN_ID, "❌ Please send a valid price (numbers only, e.g. 99).")
+        bot.register_next_step_handler(msg, save_price, plan_state)
+        return
+
+    minutes = plan_state.pop("temp_minutes")
+    plan_state["plans"][minutes] = text
+
+    if plan_state["current"] < plan_state["total"]:
+        plan_state["current"] += 1
+        ask_minutes(message, plan_state)
+    else:
+        finalize_channel(plan_state)
+
+def finalize_channel(plan_state):
+    ch_id = plan_state["ch_id"]
+    ch_name = plan_state["ch_name"]
+    plans_dict = plan_state["plans"]
+
+    channels_col.update_one(
+        {"channel_id": ch_id},
+        {"$set": {"name": ch_name, "plans": plans_dict, "admin_id": ADMIN_ID}},
+        upsert=True
+    )
+
+    summary_lines = []
+    for mins, price in plans_dict.items():
+        label = f"{mins} Min" if int(mins) < 60 else f"{int(mins)//1440} Days"
+        summary_lines.append(f"• {label} — ₹{price}")
+    summary = "\n".join(summary_lines)
+
+    bot_username = bot.get_me().username
+    bot.send_message(ADMIN_ID,
+        f"✅ Setup Successful!\n\nPlans for *{ch_name}*:\n{summary}\n\nInvite Link for users:\n`https://t.me/{bot_username}?start={ch_id}`",
+        parse_mode="Markdown")
 
 # --- USER: PAYMENT FLOW ---
 
