@@ -32,6 +32,10 @@ db = client['sub_management']
 channels_col = db['channels']
 users_col = db['users']
 
+# In-memory store for pending payment proofs (cleared if bot restarts — that's fine,
+# user just taps "I Have Paid" again)
+pending_payments = {}  # { user_id: {"ch_id": int, "mins": str, "price": str} }
+
 # --- ADMIN LOGIC ---
 
 @bot.message_handler(commands=['start'])
@@ -193,21 +197,51 @@ def user_pays(call):
                    reply_markup=markup, parse_mode="Markdown")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('paid_'))
-def admin_notify(call):
+def request_proof(call):
     _, ch_id, mins = call.data.split('_')
     user = call.from_user
     ch_data = channels_col.find_one({"channel_id": int(ch_id)})
     price = ch_data['plans'][mins]
 
+    # Stash the pending payment details in memory until the screenshot arrives
+    pending_payments[user.id] = {"ch_id": int(ch_id), "mins": mins, "price": price}
+
+    bot.answer_callback_query(call.id)
+    msg = bot.send_message(call.message.chat.id,
+        "📸 Please send a screenshot of your payment as proof.\n\nJust send the photo here — it'll be forwarded to the admin for verification.")
+    bot.register_next_step_handler(msg, receive_proof)
+
+
+def receive_proof(message):
+    user = message.from_user
+
+    if user.id not in pending_payments:
+        bot.send_message(message.chat.id, "⚠️ Your payment session expired or wasn't found. Please start again by selecting a plan.")
+        return
+
+    if not message.photo:
+        msg = bot.send_message(message.chat.id, "❌ That doesn't look like a photo. Please send a screenshot image of your payment.")
+        bot.register_next_step_handler(msg, receive_proof)
+        return
+
+    data = pending_payments.pop(user.id)
+    ch_data = channels_col.find_one({"channel_id": data["ch_id"]})
+    photo_file_id = message.photo[-1].file_id  # highest resolution available
+
     markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("✅ Approve", callback_data=f"app_{user.id}_{ch_id}_{mins}"))
+    markup.add(InlineKeyboardButton("✅ Approve", callback_data=f"app_{user.id}_{data['ch_id']}_{data['mins']}"))
     markup.add(InlineKeyboardButton("❌ Reject", callback_data=f"rej_{user.id}"))
 
-    bot.send_message(ADMIN_ID, f"🔔 *Payment Verification Required!*\n\nUser: {user.first_name}\nChannel: {ch_data['name']}\nPlan: {mins} Mins\nPrice: ₹{price}",
-                     reply_markup=markup, parse_mode="Markdown")
+    caption = (f"🔔 *Payment Verification Required!*\n\n"
+               f"User: {user.first_name} (`{user.id}`)\n"
+               f"Channel: {ch_data['name']}\n"
+               f"Plan: {data['mins']} Mins\n"
+               f"Price: ₹{data['price']}")
+
+    bot.send_photo(ADMIN_ID, photo_file_id, caption=caption, reply_markup=markup, parse_mode="Markdown")
 
     u_markup = InlineKeyboardMarkup().add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
-    bot.send_message(call.message.chat.id, "✅ Your payment request has been sent. Please wait for Admin approval.", reply_markup=u_markup)
+    bot.send_message(message.chat.id, "✅ Your payment proof has been sent. Please wait for Admin approval.", reply_markup=u_markup)
 
 # --- APPROVAL & EXPIRY ---
 
@@ -225,10 +259,20 @@ def approve_now(call):
         users_col.update_one({"user_id": u_id, "channel_id": ch_id}, {"$set": {"expiry": expiry_datetime.timestamp()}}, upsert=True)
 
         bot.send_message(u_id, f"🥳 *Payment Approved!*\n\nSubscription: {mins} Minutes\n\nJoin Link: {link.invite_link}\n\n⚠️ Note: This link and your access will expire in {mins} minutes.", parse_mode="Markdown")
-        bot.edit_message_text(f"✅ Approved user {u_id} for {mins} mins.", call.message.chat.id, call.message.message_id)
+        bot.edit_message_caption(f"✅ Approved user {u_id} for {mins} mins.", call.message.chat.id, call.message.message_id)
 
     except Exception as e:
         bot.send_message(ADMIN_ID, f"❌ Error: {e}")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('rej_'))
+def reject_payment(call):
+    u_id = int(call.data.split('_')[1])
+    try:
+        bot.send_message(u_id, "❌ Your payment could not be verified. Please contact admin if you believe this is a mistake.",
+                          reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}")))
+    except Exception:
+        pass
+    bot.edit_message_caption(f"❌ Rejected payment from user {u_id}.", call.message.chat.id, call.message.message_id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('manage_'))
 def manage_ch(call):
