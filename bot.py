@@ -39,12 +39,28 @@ client = MongoClient(MONGO_URI)
 db = client['sub_management']
 channels_col = db['channels']
 users_col = db['users']
-coins_col = db['coins']  # { user_id, coins, referred_by, referred_users: [] }
+coins_col = db['coins']
+all_users_col = db['all_users']
 
 pending_payments = {}
 processed_email_ids = set()
 
 # --- HELPERS ---
+
+def track_user(user):
+    today = datetime.now().strftime("%Y-%m-%d")
+    all_users_col.update_one(
+        {"user_id": user.id},
+        {"$set": {
+            "user_id": user.id,
+            "name": user.first_name,
+            "username": user.username or "",
+        },
+        "$setOnInsert": {
+            "joined_date": today
+        }},
+        upsert=True
+    )
 
 def get_coin_data(user_id):
     data = coins_col.find_one({"user_id": user_id})
@@ -52,9 +68,6 @@ def get_coin_data(user_id):
         coins_col.insert_one({"user_id": user_id, "coins": 0, "referred_users": []})
         data = coins_col.find_one({"user_id": user_id})
     return data
-
-def add_coins(user_id, amount):
-    coins_col.update_one({"user_id": user_id}, {"$inc": {"coins": amount}}, upsert=True)
 
 def get_unique_amount(base_price):
     base = int(base_price)
@@ -65,12 +78,11 @@ def get_unique_amount(base_price):
     return base + 1
 
 def show_plan_menu(chat_id, ch_id, ch_data):
-    """Show main plan selection screen with all buttons."""
     markup = InlineKeyboardMarkup()
     for p_time, p_price in ch_data['plans'].items():
         label = f"{p_time} Min" if int(p_time) < 60 else f"{int(p_time)//1440} Days"
         markup.add(InlineKeyboardButton(f"💳 {label} - ₹{p_price}", callback_data=f"select_{ch_id}_{p_time}"))
-    markup.add(InlineKeyboardButton("🎁 Share Link & Get Subscription", callback_data=f"referral_{ch_id}"))
+    markup.add(InlineKeyboardButton("🎁 FREE SUBSCRIPTION", callback_data=f"referral_{ch_id}"))
     markup.add(InlineKeyboardButton("💰 Show My Coin Balance", callback_data=f"coinbalance_{ch_id}"))
     markup.add(InlineKeyboardButton("🎟 Redeem My Coins", callback_data=f"redeem_{ch_id}"))
     markup.add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
@@ -107,18 +119,15 @@ def check_gmail_payments():
         mail = imaplib.IMAP4_SSL('imap.gmail.com')
         mail.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
         mail.select('inbox')
-
         email_ids = []
         for term in ['payment', 'debited', 'credited', 'UPI', 'received', 'paid']:
             _, data = mail.search(None, f'(UNSEEN SUBJECT "{term}")')
             email_ids += data[0].split()
         email_ids = list(set(email_ids))
-
         for eid in email_ids:
             eid_str = eid.decode() if isinstance(eid, bytes) else eid
             if eid_str in processed_email_ids:
                 continue
-
             _, msg_data = mail.fetch(eid, '(RFC822)')
             msg = email.message_from_bytes(msg_data[0][1])
             subject = msg.get('subject', '')
@@ -136,11 +145,9 @@ def check_gmail_payments():
                     body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
                 except Exception:
                     pass
-
             amount = extract_amount_from_text(subject + " " + body)
             if amount is None:
                 continue
-
             amount_key = int(amount)
             if amount_key in pending_payments:
                 entry = pending_payments.pop(amount_key)
@@ -213,10 +220,11 @@ def start_handler(message):
     user_id = message.from_user.id
     text = message.text.split()
 
+    track_user(message.from_user)
+
     if len(text) > 1:
         param = text[1]
 
-        # Referral link handler
         if param.startswith("ref_"):
             referrer_id = int(param.split("_")[1])
             if referrer_id != user_id:
@@ -237,14 +245,10 @@ def start_handler(message):
                     except Exception:
                         pass
 
-            # Still show the channel menu to the new user
-            # Try to find a channel to show — show first available channel
             ch_data = channels_col.find_one({"admin_id": ADMIN_ID})
             if ch_data:
                 show_plan_menu(message.chat.id, ch_data['channel_id'], ch_data)
                 return
-
-        # Normal deep link
         else:
             try:
                 ch_id = int(param)
@@ -257,11 +261,44 @@ def start_handler(message):
 
     if user_id == ADMIN_ID:
         bot.send_message(message.chat.id,
-            "✅ Admin Panel Active!\n\n/add - Add/Edit Channel & Prices\n/channels - Manage Existing Channels")
+            "✅ Admin Panel Active!\n\n"
+            "/add - Add/Edit Channel & Prices\n"
+            "/channels - Manage Existing Channels\n"
+            "/stats - View Bot Statistics")
     else:
         bot.send_message(message.chat.id, "Welcome! To join a channel, please use the link provided by the Admin.")
 
-# --- ADMIN ---
+# --- STATS ---
+
+@bot.message_handler(commands=['stats'], func=lambda m: m.from_user.id == ADMIN_ID)
+def show_stats(message):
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        total_users = all_users_col.count_documents({})
+        new_today = all_users_col.count_documents({"joined_date": today})
+        now_ts = datetime.now().timestamp()
+        active_subs = users_col.count_documents({"expiry": {"$gt": now_ts}})
+        total_referrals = 0
+        for doc in coins_col.find({}):
+            total_referrals += len(doc.get("referred_users", []))
+        coins_pipeline = [{"$group": {"_id": None, "total": {"$sum": "$coins"}}}]
+        coins_result = list(coins_col.aggregate(coins_pipeline))
+        total_coins = coins_result[0]['total'] if coins_result else 0
+        total_channels = channels_col.count_documents({"admin_id": ADMIN_ID})
+        bot.send_message(ADMIN_ID,
+            f"📊 *Bot Statistics*\n\n"
+            f"👥 Total Users: *{total_users}*\n"
+            f"🆕 New Users Today: *{new_today}*\n"
+            f"💳 Active Subscribers: *{active_subs}*\n"
+            f"📢 Total Channels: *{total_channels}*\n\n"
+            f"🔗 Total Referrals Made: *{total_referrals}*\n"
+            f"🪙 Total Coins In Circulation: *{total_coins}*\n"
+            f"⏱ Coin Value: *1 coin = {MINUTES_PER_COIN} minutes*",
+            parse_mode="Markdown")
+    except Exception as e:
+        bot.send_message(ADMIN_ID, f"❌ Error fetching stats: {e}")
+
+# --- ADMIN CHANNEL MANAGEMENT ---
 
 @bot.message_handler(commands=['channels'], func=lambda m: m.from_user.id == ADMIN_ID)
 def list_channels(message):
@@ -367,13 +404,11 @@ def show_referral(call):
     user = call.from_user
     bot_username = bot.get_me().username
     ref_link = f"https://t.me/{bot_username}?start=ref_{user.id}"
-
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("🔙 Back to Plans", callback_data=f"backplans_{ch_id}"))
-
     bot.answer_callback_query(call.id)
     bot.send_message(call.message.chat.id,
-        f"🎁 *Share Link & Get Subscription!*\n\n"
+        f"🎁 *FREE SUBSCRIPTION*\n\n"
         f"Your personal referral link:\n`{ref_link}`\n\n"
         f"📌 *How it works:*\n"
         f"→ Share your link with friends\n"
@@ -384,8 +419,7 @@ def show_referral(call):
         f"→ 1 coin = 2 minutes free access\n"
         f"→ 5 coins = 10 minutes\n"
         f"→ 30 coins = 1 hour\n"
-        f"→ 720 coins = 1 full day 🔥\n\n"
-        f"Tap the buttons below to check your balance or redeem!",
+        f"→ 720 coins = 1 full day 🔥",
         reply_markup=markup, parse_mode="Markdown")
 
 # --- COIN BALANCE ---
@@ -397,11 +431,9 @@ def show_coin_balance(call):
     data = get_coin_data(user.id)
     coins = data.get('coins', 0)
     worth_minutes = coins * MINUTES_PER_COIN
-
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("🎟 Redeem My Coins", callback_data=f"redeem_{ch_id}"))
     markup.add(InlineKeyboardButton("🔙 Back to Plans", callback_data=f"backplans_{ch_id}"))
-
     bot.answer_callback_query(call.id)
     bot.send_message(call.message.chat.id,
         f"💰 *Your Coin Balance*\n\n"
@@ -409,14 +441,13 @@ def show_coin_balance(call):
         f"⏱ Worth: *{worth_minutes} minutes* of free access\n\n"
         f"📌 *How to earn coins:*\n"
         f"→ Share your referral link with friends\n"
-        f"→ Each new friend who opens the bot using your link = 1 coin\n"
+        f"→ Each new friend who opens the bot = 1 coin\n"
         f"→ Each friend can only give you 1 coin\n\n"
         f"💡 *Coin value:*\n"
         f"→ 1 coin = 2 minutes\n"
         f"→ 5 coins = 10 minutes\n"
         f"→ 30 coins = 1 hour\n"
-        f"→ 720 coins = 1 full day 🔥\n\n"
-        f"Ready to use your coins? Tap Redeem below!",
+        f"→ 720 coins = 1 full day 🔥",
         reply_markup=markup, parse_mode="Markdown")
 
 # --- REDEEM COINS ---
@@ -428,12 +459,10 @@ def redeem_coins_start(call):
     data = get_coin_data(user.id)
     coins = data.get('coins', 0)
     worth_minutes = coins * MINUTES_PER_COIN
-
     bot.answer_callback_query(call.id)
-
     if coins == 0:
         markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🎁 Get My Referral Link", callback_data=f"referral_{ch_id}"))
+        markup.add(InlineKeyboardButton("🎁 FREE SUBSCRIPTION", callback_data=f"referral_{ch_id}"))
         markup.add(InlineKeyboardButton("🔙 Back to Plans", callback_data=f"backplans_{ch_id}"))
         bot.send_message(call.message.chat.id,
             "🪙 *You have 0 coins*\n\n"
@@ -441,10 +470,8 @@ def redeem_coins_start(call):
             "📌 Share your referral link with friends to earn coins and get free access!",
             reply_markup=markup, parse_mode="Markdown")
         return
-
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("🔙 Cancel", callback_data=f"backplans_{ch_id}"))
-
     msg = bot.send_message(call.message.chat.id,
         f"🎟 *Redeem Your Coins*\n\n"
         f"You currently have *{coins} coins*\n"
@@ -458,21 +485,17 @@ def redeem_coins_start(call):
         reply_markup=markup, parse_mode="Markdown")
     bot.register_next_step_handler(msg, process_redeem, ch_id, coins)
 
-
 def process_redeem(message, ch_id, max_coins):
     user = message.from_user
     text = message.text.strip()
-
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("🔙 Back to Plans", callback_data=f"backplans_{ch_id}"))
-
     if not text.isdigit() or int(text) < 1:
         msg = bot.send_message(message.chat.id,
             f"❌ Please send a valid number between 1 and {max_coins}.",
             reply_markup=markup)
         bot.register_next_step_handler(msg, process_redeem, ch_id, max_coins)
         return
-
     coins_to_use = int(text)
     if coins_to_use > max_coins:
         msg = bot.send_message(message.chat.id,
@@ -480,26 +503,18 @@ def process_redeem(message, ch_id, max_coins):
             reply_markup=markup)
         bot.register_next_step_handler(msg, process_redeem, ch_id, max_coins)
         return
-
     minutes = coins_to_use * MINUTES_PER_COIN
     ch_id_int = int(ch_id)
-
     try:
         expiry_datetime = datetime.now() + timedelta(minutes=minutes)
         expiry_ts = int(expiry_datetime.timestamp())
-
         link = bot.create_chat_invite_link(ch_id_int, member_limit=1, expire_date=expiry_ts)
-
-        # Deduct coins
         coins_col.update_one({"user_id": user.id}, {"$inc": {"coins": -coins_to_use}})
-
-        # Save to users_col for auto kick
         users_col.update_one(
             {"user_id": user.id, "channel_id": ch_id_int},
             {"$set": {"expiry": expiry_datetime.timestamp()}},
             upsert=True
         )
-
         bot.send_message(message.chat.id,
             f"🥳 *Access Granted!*\n\n"
             f"🪙 Coins used: {coins_to_use}\n"
@@ -507,17 +522,14 @@ def process_redeem(message, ch_id, max_coins):
             f"Join Link: {link.invite_link}\n\n"
             f"⚠️ You will be automatically removed after {minutes} minutes.",
             parse_mode="Markdown")
-
-        # Notify admin
         bot.send_message(ADMIN_ID,
             f"🪙 *Coin Redemption*\n\n"
             f"User: {user.first_name} (`{user.id}`)\n"
             f"Coins used: {coins_to_use}\n"
             f"Access: {minutes} minutes",
             parse_mode="Markdown")
-
     except Exception as e:
-        bot.send_message(message.chat.id, f"❌ Something went wrong. Please contact admin.")
+        bot.send_message(message.chat.id, "❌ Something went wrong. Please contact admin.")
         bot.send_message(ADMIN_ID, f"❌ Redeem error for user {user.id}: {e}")
 
 # --- BACK TO PLANS ---
@@ -540,9 +552,7 @@ def user_pays(call):
     ch_data = channels_col.find_one({"channel_id": int(ch_id)})
     price = ch_data['plans'][mins]
     unique_amount = get_unique_amount(price)
-
     qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=upi://pay?pa={UPI_ID}%26am={unique_amount}%26cu=INR"
-
     pending_payments[unique_amount] = {
         "user_id": call.from_user.id,
         "user_name": call.from_user.first_name,
@@ -553,12 +563,10 @@ def user_pays(call):
         "photo_file_id": None,
         "fallback_sent": False
     }
-
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("✅ I Have Paid", callback_data=f"paid_{ch_id}_{mins}_{unique_amount}"))
     markup.add(InlineKeyboardButton("🔙 Choose Another Plan", callback_data=f"backplans_{ch_id}"))
     markup.add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
-
     bot.send_photo(call.message.chat.id, qr_url,
         caption=(f"Plan: {mins} Minutes\n"
                  f"Price: ₹{price}\n"
@@ -572,17 +580,13 @@ def request_proof(call):
     parts = call.data.split('_')
     ch_id = parts[1]
     unique_amount = int(parts[3])
-
     if unique_amount not in pending_payments:
         bot.answer_callback_query(call.id)
         bot.send_message(call.message.chat.id, "✅ Your payment was already verified! Check above for your invite link.")
         return
-
     bot.answer_callback_query(call.id)
-
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("🔙 Cancel / Choose Another Plan", callback_data=f"cancelproof_{ch_id}_{unique_amount}"))
-
     msg = bot.send_message(call.message.chat.id,
         "📸 Please send a screenshot of your payment as proof.\n\n"
         "The bot will also try to verify automatically via email.",
@@ -616,11 +620,9 @@ def receive_proof(message, unique_amount):
             reply_markup=markup)
         bot.register_next_step_handler(msg, receive_proof, unique_amount)
         return
-
     photo_file_id = message.photo[-1].file_id
     pending_payments[unique_amount]['photo_file_id'] = photo_file_id
     pending_payments[unique_amount]['timestamp'] = datetime.now()
-
     bot.send_message(message.chat.id,
         "⏳ *Got your screenshot!*\n\n"
         "The bot is now verifying your payment automatically.\n\n"
