@@ -86,8 +86,12 @@ def show_plan_menu(chat_id, ch_id, ch_data):
     markup.add(InlineKeyboardButton("💰 Show My Coin Balance", callback_data=f"coinbalance_{ch_id}"))
     markup.add(InlineKeyboardButton("🎟 Redeem My Coins", callback_data=f"redeem_{ch_id}"))
     markup.add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
+
+    description = ch_data.get('description', '').strip()
+    desc_block = f"\n{description}\n" if description else ""
+
     bot.send_message(chat_id,
-        f"Welcome!\n\nYou are joining: *{ch_data['name']}*.\n\nPlease select a subscription plan below:",
+        f"Welcome!\n\nYou are joining: *{ch_data['name']}*.\n{desc_block}\nPlease select a subscription plan below:",
         reply_markup=markup, parse_mode="Markdown")
 
 # --- GMAIL IMAP ---
@@ -263,6 +267,7 @@ def start_handler(message):
         bot.send_message(message.chat.id,
             "✅ Admin Panel Active!\n\n"
             "/add - Add/Edit Channel & Prices\n"
+            "/setdescription - Set/Update Channel Description\n"
             "/channels - Manage Existing Channels\n"
             "/stats - View Bot Statistics")
     else:
@@ -395,6 +400,24 @@ def finalize_channel(plan_state):
             parse_mode="Markdown")
     except Exception as e:
         bot.send_message(ADMIN_ID, f"❌ Something went wrong while saving: {e}")
+
+# --- CHANNEL DESCRIPTION (NEW) ---
+
+@bot.message_handler(commands=['setdescription'], func=lambda m: m.from_user.id == ADMIN_ID)
+def set_description_start(message):
+    ch_data = channels_col.find_one({"admin_id": ADMIN_ID})
+    if not ch_data:
+        bot.send_message(ADMIN_ID, "❌ No channel found. Use /add first.")
+        return
+    msg = bot.send_message(ADMIN_ID,
+        f"Send the new description for *{ch_data['name']}*\n(what the channel provides — this will be shown to users):",
+        parse_mode="Markdown")
+    bot.register_next_step_handler(msg, save_description_only, ch_data['channel_id'])
+
+def save_description_only(message, ch_id):
+    description = message.text.strip()
+    channels_col.update_one({"channel_id": ch_id}, {"$set": {"description": description}})
+    bot.send_message(ADMIN_ID, "✅ Description updated! It will now show to users.")
 
 # --- REFERRAL ---
 
