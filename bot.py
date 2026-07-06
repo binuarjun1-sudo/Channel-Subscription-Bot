@@ -1,4 +1,4 @@
-import os
+ import os
 import re
 import imaplib
 import email
@@ -32,7 +32,7 @@ GMAIL_ADDRESS = os.getenv('GMAIL_ADDRESS')
 GMAIL_APP_PASSWORD = os.getenv('GMAIL_APP_PASSWORD')
 
 COINS_PER_REFERRAL = 1
-MINUTES_PER_COIN = 2
+DEFAULT_MINUTES_PER_COIN = 2
 
 bot = telebot.TeleBot(BOT_TOKEN)
 client = MongoClient(MONGO_URI)
@@ -41,13 +41,26 @@ channels_col = db['channels']
 users_col = db['users']
 coins_col = db['coins']
 all_users_col = db['all_users']
-payments_col = db['payments']       # tracks every approved payment
-bot_state_col = db['bot_state']     # stores pause/resume state and message
+payments_col = db['payments']
+bot_state_col = db['bot_state']
 
 pending_payments = {}
 processed_email_ids = set()
 
 # --- BOT STATE HELPERS ---
+
+def get_minutes_per_coin():
+    state = bot_state_col.find_one({"_id": "coin_value"})
+    if state:
+        return state.get("minutes_per_coin", DEFAULT_MINUTES_PER_COIN)
+    return DEFAULT_MINUTES_PER_COIN
+
+def set_minutes_per_coin(value):
+    bot_state_col.update_one(
+        {"_id": "coin_value"},
+        {"$set": {"minutes_per_coin": value}},
+        upsert=True
+    )
 
 def is_bot_paused():
     state = bot_state_col.find_one({"_id": "state"})
@@ -95,7 +108,6 @@ def get_unique_amount(base_price):
     return base + 1
 
 def broadcast_to_all(message_text, extra_markup=None):
-    """Send a message to every user who has ever started the bot."""
     all_users = all_users_col.find({})
     success = 0
     failed = 0
@@ -117,14 +129,11 @@ def show_plan_menu(chat_id, ch_id, ch_data):
     markup.add(InlineKeyboardButton("💰 Show My Coin Balance", callback_data=f"coinbalance_{ch_id}"))
     markup.add(InlineKeyboardButton("🎟 Redeem My Coins", callback_data=f"redeem_{ch_id}"))
     markup.add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
-
-    # Show channel description if set
     desc = ch_data.get("description", "")
     welcome_text = f"Welcome!\n\nYou are joining: *{ch_data['name']}*"
     if desc:
         welcome_text += f"\n\n📋 *About this channel:*\n{desc}"
     welcome_text += "\n\nPlease select a subscription plan below:"
-
     bot.send_message(chat_id, welcome_text, reply_markup=markup, parse_mode="Markdown")
 
 # --- GMAIL IMAP ---
@@ -223,7 +232,6 @@ def check_fallback_payments():
                 print(f"Fallback error: {e}")
 
 def record_payment(u_id, user_name, ch_id, mins, price):
-    """Save every approved payment for revenue tracking."""
     today = datetime.now().strftime("%Y-%m-%d")
     payments_col.insert_one({
         "user_id": u_id,
@@ -270,10 +278,8 @@ def auto_approve(u_id, ch_id, mins, photo_file_id, user_name, price):
 def start_handler(message):
     user_id = message.from_user.id
     text = message.text.split()
-
     track_user(message.from_user)
 
-    # If bot is paused, show pause message to non-admin users
     if is_bot_paused() and user_id != ADMIN_ID:
         bot.send_message(message.chat.id,
             f"🔴 *Bot is currently paused*\n\n"
@@ -284,7 +290,6 @@ def start_handler(message):
 
     if len(text) > 1:
         param = text[1]
-
         if param.startswith("ref_"):
             referrer_id = int(param.split("_")[1])
             if referrer_id != user_id:
@@ -325,43 +330,34 @@ def start_handler(message):
             "/channels — Manage Existing Channels\n"
             "/setdesc — Set Channel Description\n"
             "/stats — View Full Bot Statistics\n"
+            "/setcoin — Change Coin Value\n"
+            "/broadcast — Broadcast Message to All Users\n"
             "/pause — Pause Bot & Notify Users\n"
             "/resume — Resume Bot & Notify Users",
             parse_mode="Markdown")
     else:
         bot.send_message(message.chat.id, "Welcome! To join a channel, please use the link provided by the Admin.")
 
-# --- STATS COMMAND ---
+# --- STATS ---
 
 @bot.message_handler(commands=['stats'], func=lambda m: m.from_user.id == ADMIN_ID)
 def show_stats(message):
     try:
         today = datetime.now().strftime("%Y-%m-%d")
         now_ts = datetime.now().timestamp()
-
-        # Users
         total_users = all_users_col.count_documents({})
         new_today = all_users_col.count_documents({"joined_date": today})
-
-        # Subscribers
         active_subs = users_col.count_documents({"expiry": {"$gt": now_ts}})
         total_subs_ever = payments_col.count_documents({})
-
-        # Revenue
         today_revenue_pipeline = [
             {"$match": {"date": today}},
             {"$group": {"_id": None, "total": {"$sum": "$price"}}}
         ]
         today_rev_result = list(payments_col.aggregate(today_revenue_pipeline))
         today_revenue = today_rev_result[0]['total'] if today_rev_result else 0
-
-        total_revenue_pipeline = [
-            {"$group": {"_id": None, "total": {"$sum": "$price"}}}
-        ]
+        total_revenue_pipeline = [{"$group": {"_id": None, "total": {"$sum": "$price"}}}]
         total_rev_result = list(payments_col.aggregate(total_revenue_pipeline))
         total_revenue = total_rev_result[0]['total'] if total_rev_result else 0
-
-        # This month revenue
         this_month = datetime.now().strftime("%Y-%m")
         month_revenue_pipeline = [
             {"$match": {"date": {"$regex": f"^{this_month}"}}},
@@ -369,26 +365,16 @@ def show_stats(message):
         ]
         month_rev_result = list(payments_col.aggregate(month_revenue_pipeline))
         month_revenue = month_rev_result[0]['total'] if month_rev_result else 0
-
-        # Payments today count
         payments_today = payments_col.count_documents({"date": today})
-
-        # Referrals
         total_referrals = 0
         for doc in coins_col.find({}):
             total_referrals += len(doc.get("referred_users", []))
-
-        # Coins
         coins_pipeline = [{"$group": {"_id": None, "total": {"$sum": "$coins"}}}]
         coins_result = list(coins_col.aggregate(coins_pipeline))
         total_coins = coins_result[0]['total'] if coins_result else 0
-
-        # Channels
         total_channels = channels_col.count_documents({"admin_id": ADMIN_ID})
-
-        # Bot state
         state = "🟢 Running" if not is_bot_paused() else "🔴 Paused"
-
+        mpc = get_minutes_per_coin()
         bot.send_message(ADMIN_ID,
             f"📊 *Full Bot Statistics*\n\n"
             f"━━━━━━━━━━━━━━━\n"
@@ -409,108 +395,96 @@ def show_stats(message):
             f"🎁 *Referral System*\n"
             f"→ Total Referrals: *{total_referrals}*\n"
             f"→ Coins In Circulation: *{total_coins}*\n"
-            f"→ Coin Value: *1 coin = {MINUTES_PER_COIN} mins*\n\n"
+            f"→ Coin Value: *1 coin = {mpc} mins*\n\n"
             f"━━━━━━━━━━━━━━━\n"
             f"📢 *Channels*\n"
             f"→ Total Channels: *{total_channels}*\n\n"
             f"━━━━━━━━━━━━━━━\n"
             f"🤖 *Bot Status:* {state}",
             parse_mode="Markdown")
-
     except Exception as e:
         bot.send_message(ADMIN_ID, f"❌ Error fetching stats: {e}")
 
-# --- SET DESCRIPTION COMMAND ---
+# --- SET COIN VALUE ---
 
-@bot.message_handler(commands=['setdesc'], func=lambda m: m.from_user.id == ADMIN_ID)
-def set_desc_start(message):
-    cursor = channels_col.find({"admin_id": ADMIN_ID})
-    channels = list(cursor)
+@bot.message_handler(commands=['setcoin'], func=lambda m: m.from_user.id == ADMIN_ID)
+def set_coin_start(message):
+    mpc = get_minutes_per_coin()
+    msg = bot.send_message(ADMIN_ID,
+        f"🪙 *Change Coin Value*\n\n"
+        f"Current value: *1 coin = {mpc} minutes*\n\n"
+        f"Send the new number of minutes per coin\n"
+        f"(e.g. send *10* to make 1 coin = 10 minutes):",
+        parse_mode="Markdown")
+    bot.register_next_step_handler(msg, save_coin_value)
 
-    if not channels:
-        bot.send_message(ADMIN_ID, "❌ No channels found. Use /add to add a channel first.")
+def save_coin_value(message):
+    text = message.text.strip()
+    if not text.isdigit() or int(text) < 1:
+        msg = bot.send_message(ADMIN_ID, "❌ Please send a valid number (e.g. 10).")
+        bot.register_next_step_handler(msg, save_coin_value)
         return
+    new_value = int(text)
+    set_minutes_per_coin(new_value)
+    bot.send_message(ADMIN_ID,
+        f"✅ *Coin Value Updated!*\n\n"
+        f"🪙 New value: *1 coin = {new_value} minutes*\n\n"
+        f"This applies to all future redemptions immediately!",
+        parse_mode="Markdown")
+
+# --- BROADCAST ---
+
+@bot.message_handler(commands=['broadcast'], func=lambda m: m.from_user.id == ADMIN_ID)
+def broadcast_start(message):
+    msg = bot.send_message(ADMIN_ID,
+        "📢 *Broadcast Message*\n\n"
+        "Send the message you want to broadcast to all users.\n\n"
+        "You can use:\n"
+        "→ *bold* for bold text\n"
+        "→ _italic_ for italic\n"
+        "→ Emojis for engagement 🔥\n\n"
+        "Type your message now:",
+        parse_mode="Markdown")
+    bot.register_next_step_handler(msg, confirm_broadcast)
+
+def confirm_broadcast(message):
+    broadcast_text = message.text.strip()
 
     markup = InlineKeyboardMarkup()
-    for ch in channels:
-        markup.add(InlineKeyboardButton(f"📢 {ch['name']}", callback_data=f"descselect_{ch['channel_id']}"))
+    markup.add(InlineKeyboardButton("✅ Yes Send It", callback_data=f"confirmbc_yes"))
+    markup.add(InlineKeyboardButton("❌ Cancel", callback_data=f"confirmbc_no"))
 
-    bot.send_message(ADMIN_ID, "Which channel do you want to set a description for?", reply_markup=markup)
+    # Save message temporarily in bot_state
+    bot_state_col.update_one(
+        {"_id": "pending_broadcast"},
+        {"$set": {"message": broadcast_text}},
+        upsert=True
+    )
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('descselect_'))
-def desc_channel_selected(call):
-    ch_id = int(call.data.split('_')[1])
-    ch_data = channels_col.find_one({"channel_id": ch_id})
+    bot.send_message(ADMIN_ID,
+        f"📢 *Preview of your broadcast:*\n\n"
+        f"{broadcast_text}\n\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"Send this to all users?",
+        reply_markup=markup, parse_mode="Markdown")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('confirmbc_'))
+def handle_broadcast_confirm(call):
+    action = call.data.split('_')[1]
     bot.answer_callback_query(call.id)
-    msg = bot.send_message(ADMIN_ID,
-        f"📝 Setting description for: *{ch_data['name']}*\n\n"
-        f"Send the description text now.\n"
-        f"This will be shown to users when they open the bot link.",
-        parse_mode="Markdown")
-    bot.register_next_step_handler(msg, save_description, ch_id)
 
-def save_description(message, ch_id):
-    desc = message.text.strip()
-    channels_col.update_one({"channel_id": ch_id}, {"$set": {"description": desc}})
-    ch_data = channels_col.find_one({"channel_id": ch_id})
-    bot.send_message(ADMIN_ID,
-        f"✅ Description saved for *{ch_data['name']}*!\n\n"
-        f"📋 Preview:\n{desc}\n\n"
-        f"Users will now see this when they open your bot link.",
-        parse_mode="Markdown")
-
-# --- PAUSE COMMAND ---
-
-@bot.message_handler(commands=['pause'], func=lambda m: m.from_user.id == ADMIN_ID)
-def pause_bot(message):
-    if is_bot_paused():
-        bot.send_message(ADMIN_ID, "⚠️ Bot is already paused. Use /resume to resume it.")
+    if action == "no":
+        bot.edit_message_text("❌ Broadcast cancelled.", call.message.chat.id, call.message.message_id)
         return
-    msg = bot.send_message(ADMIN_ID,
-        "⏸ *Pause Bot*\n\n"
-        "Please send the message you want to show to users while the bot is paused.\n\n"
-        "Example: _We are updating the bot. Back in 10 minutes!_",
-        parse_mode="Markdown")
-    bot.register_next_step_handler(msg, confirm_pause)
 
-def confirm_pause(message):
-    pause_msg = message.text.strip()
-    set_bot_paused(True, pause_msg)
-
-    # Broadcast pause message to all users
-    broadcast_text = (f"🔴 *Bot Paused*\n\n"
-                      f"{pause_msg}\n\n"
-                      f"We apologize for the inconvenience. Please wait for the bot to resume.")
-
-    bot.send_message(ADMIN_ID, "⏳ Broadcasting pause message to all users...")
-    success, failed = broadcast_to_all(broadcast_text)
-
-    bot.send_message(ADMIN_ID,
-        f"✅ *Bot Paused Successfully!*\n\n"
-        f"📨 Broadcast sent to *{success}* users\n"
-        f"❌ Failed for *{failed}* users (they may have blocked the bot)\n\n"
-        f"Use /resume when you're ready to bring the bot back online.",
-        parse_mode="Markdown")
-
-# --- RESUME COMMAND ---
-
-@bot.message_handler(commands=['resume'], func=lambda m: m.from_user.id == ADMIN_ID)
-def resume_bot(message):
-    if not is_bot_paused():
-        bot.send_message(ADMIN_ID, "⚠️ Bot is already running. Use /pause to pause it.")
+    pending = bot_state_col.find_one({"_id": "pending_broadcast"})
+    if not pending:
+        bot.send_message(ADMIN_ID, "❌ Broadcast message not found. Please try again.")
         return
-    msg = bot.send_message(ADMIN_ID,
-        "▶️ *Resume Bot*\n\n"
-        "Please send the message you want to broadcast to all users when resuming.\n\n"
-        "Example: _Bot is back! New content added. Join now!_",
-        parse_mode="Markdown")
-    bot.register_next_step_handler(msg, confirm_resume)
 
-def confirm_resume(message):
-    resume_msg = message.text.strip()
-    set_bot_paused(False, "")
+    broadcast_text = pending['message']
+    bot_state_col.delete_one({"_id": "pending_broadcast"})
 
-    # Get channel link to include in broadcast
     ch_data = channels_col.find_one({"admin_id": ADMIN_ID})
     bot_username = bot.get_me().username
 
@@ -520,13 +494,110 @@ def confirm_resume(message):
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("🚀 Join Now!", url=ch_link))
 
+    full_message = f"📢 *Message from Admin*\n\n{broadcast_text}"
+
+    bot.edit_message_text("⏳ Broadcasting message to all users...",
+                          call.message.chat.id, call.message.message_id)
+
+    success, failed = broadcast_to_all(full_message, markup)
+
+    bot.send_message(ADMIN_ID,
+        f"✅ *Broadcast Complete!*\n\n"
+        f"📨 Sent to: *{success}* users\n"
+        f"❌ Failed: *{failed}* users\n\n"
+        f"_(Failed users may have blocked the bot)_",
+        parse_mode="Markdown")
+
+# --- SET DESCRIPTION ---
+
+@bot.message_handler(commands=['setdesc'], func=lambda m: m.from_user.id == ADMIN_ID)
+def set_desc_start(message):
+    cursor = channels_col.find({"admin_id": ADMIN_ID})
+    channels = list(cursor)
+    if not channels:
+        bot.send_message(ADMIN_ID, "❌ No channels found. Use /add to add a channel first.")
+        return
+    markup = InlineKeyboardMarkup()
+    for ch in channels:
+        markup.add(InlineKeyboardButton(f"📢 {ch['name']}", callback_data=f"descselect_{ch['channel_id']}"))
+    bot.send_message(ADMIN_ID, "Which channel do you want to set a description for?", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('descselect_'))
+def desc_channel_selected(call):
+    ch_id = int(call.data.split('_')[1])
+    ch_data = channels_col.find_one({"channel_id": ch_id})
+    bot.answer_callback_query(call.id)
+    msg = bot.send_message(ADMIN_ID,
+        f"📝 Setting description for: *{ch_data['name']}*\n\n"
+        f"Send the description text now.",
+        parse_mode="Markdown")
+    bot.register_next_step_handler(msg, save_description, ch_id)
+
+def save_description(message, ch_id):
+    desc = message.text.strip()
+    channels_col.update_one({"channel_id": ch_id}, {"$set": {"description": desc}})
+    ch_data = channels_col.find_one({"channel_id": ch_id})
+    bot.send_message(ADMIN_ID,
+        f"✅ Description saved for *{ch_data['name']}*!\n\n"
+        f"📋 Preview:\n{desc}",
+        parse_mode="Markdown")
+
+# --- PAUSE ---
+
+@bot.message_handler(commands=['pause'], func=lambda m: m.from_user.id == ADMIN_ID)
+def pause_bot(message):
+    if is_bot_paused():
+        bot.send_message(ADMIN_ID, "⚠️ Bot is already paused. Use /resume to resume it.")
+        return
+    msg = bot.send_message(ADMIN_ID,
+        "⏸ *Pause Bot*\n\n"
+        "Please send the message you want to show to users while the bot is paused.",
+        parse_mode="Markdown")
+    bot.register_next_step_handler(msg, confirm_pause)
+
+def confirm_pause(message):
+    pause_msg = message.text.strip()
+    set_bot_paused(True, pause_msg)
+    broadcast_text = (f"🔴 *Bot Paused*\n\n"
+                      f"{pause_msg}\n\n"
+                      f"Please check back later.")
+    bot.send_message(ADMIN_ID, "⏳ Broadcasting pause message to all users...")
+    success, failed = broadcast_to_all(broadcast_text)
+    bot.send_message(ADMIN_ID,
+        f"✅ *Bot Paused Successfully!*\n\n"
+        f"📨 Broadcast sent to *{success}* users\n"
+        f"❌ Failed for *{failed}* users\n\n"
+        f"Use /resume when ready.",
+        parse_mode="Markdown")
+
+# --- RESUME ---
+
+@bot.message_handler(commands=['resume'], func=lambda m: m.from_user.id == ADMIN_ID)
+def resume_bot(message):
+    if not is_bot_paused():
+        bot.send_message(ADMIN_ID, "⚠️ Bot is already running. Use /pause to pause it.")
+        return
+    msg = bot.send_message(ADMIN_ID,
+        "▶️ *Resume Bot*\n\n"
+        "Please send the message you want to broadcast to all users when resuming.",
+        parse_mode="Markdown")
+    bot.register_next_step_handler(msg, confirm_resume)
+
+def confirm_resume(message):
+    resume_msg = message.text.strip()
+    set_bot_paused(False, "")
+    ch_data = channels_col.find_one({"admin_id": ADMIN_ID})
+    bot_username = bot.get_me().username
+    markup = None
+    if ch_data:
+        ch_link = f"https://t.me/{bot_username}?start={ch_data['channel_id']}"
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🚀 Join Now!", url=ch_link))
     broadcast_text = (f"🟢 *Bot is Back Online!*\n\n"
                       f"{resume_msg}\n\n"
                       f"Tap the button below to join! 👇")
-
     bot.send_message(ADMIN_ID, "⏳ Broadcasting resume message to all users...")
     success, failed = broadcast_to_all(broadcast_text, markup)
-
     bot.send_message(ADMIN_ID,
         f"✅ *Bot Resumed Successfully!*\n\n"
         f"📨 Broadcast sent to *{success}* users\n"
@@ -640,6 +711,7 @@ def show_referral(call):
     user = call.from_user
     bot_username = bot.get_me().username
     ref_link = f"https://t.me/{bot_username}?start=ref_{user.id}"
+    mpc = get_minutes_per_coin()
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("🔙 Back to Plans", callback_data=f"backplans_{ch_id}"))
     bot.answer_callback_query(call.id)
@@ -652,10 +724,10 @@ def show_referral(call):
         f"→ Each friend can only give you 1 coin\n"
         f"→ No purchase needed — anyone can earn!\n\n"
         f"💰 *What is a coin worth?*\n"
-        f"→ 1 coin = 2 minutes free access\n"
-        f"→ 5 coins = 10 minutes\n"
-        f"→ 30 coins = 1 hour\n"
-        f"→ 720 coins = 1 full day 🔥",
+        f"→ 1 coin = {mpc} minutes free access\n"
+        f"→ 5 coins = {5*mpc} minutes\n"
+        f"→ 30 coins = {30*mpc} minutes\n"
+        f"→ 720 coins = {720*mpc} minutes 🔥",
         reply_markup=markup, parse_mode="Markdown")
 
 # --- COIN BALANCE ---
@@ -666,7 +738,8 @@ def show_coin_balance(call):
     user = call.from_user
     data = get_coin_data(user.id)
     coins = data.get('coins', 0)
-    worth_minutes = coins * MINUTES_PER_COIN
+    mpc = get_minutes_per_coin()
+    worth_minutes = coins * mpc
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("🎟 Redeem My Coins", callback_data=f"redeem_{ch_id}"))
     markup.add(InlineKeyboardButton("🔙 Back to Plans", callback_data=f"backplans_{ch_id}"))
@@ -680,10 +753,10 @@ def show_coin_balance(call):
         f"→ Each new friend who opens the bot = 1 coin\n"
         f"→ Each friend can only give you 1 coin\n\n"
         f"💡 *Coin value:*\n"
-        f"→ 1 coin = 2 minutes\n"
-        f"→ 5 coins = 10 minutes\n"
-        f"→ 30 coins = 1 hour\n"
-        f"→ 720 coins = 1 full day 🔥",
+        f"→ 1 coin = {mpc} minutes\n"
+        f"→ 5 coins = {5*mpc} minutes\n"
+        f"→ 30 coins = {30*mpc} minutes\n"
+        f"→ 720 coins = {720*mpc} minutes 🔥",
         reply_markup=markup, parse_mode="Markdown")
 
 # --- REDEEM COINS ---
@@ -694,7 +767,8 @@ def redeem_coins_start(call):
     user = call.from_user
     data = get_coin_data(user.id)
     coins = data.get('coins', 0)
-    worth_minutes = coins * MINUTES_PER_COIN
+    mpc = get_minutes_per_coin()
+    worth_minutes = coins * mpc
     bot.answer_callback_query(call.id)
     if coins == 0:
         markup = InlineKeyboardMarkup()
@@ -714,7 +788,7 @@ def redeem_coins_start(call):
         f"Worth *{worth_minutes} minutes* of free access\n\n"
         f"📌 *How redemption works:*\n"
         f"→ Enter how many coins to redeem\n"
-        f"→ Each coin = 2 minutes access\n"
+        f"→ Each coin = {mpc} minutes access\n"
         f"→ You'll get instant access to the channel\n"
         f"→ When time is up you'll be automatically removed\n\n"
         f"How many coins do you want to redeem? (max {coins})",
@@ -724,6 +798,7 @@ def redeem_coins_start(call):
 def process_redeem(message, ch_id, max_coins):
     user = message.from_user
     text = message.text.strip()
+    mpc = get_minutes_per_coin()
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("🔙 Back to Plans", callback_data=f"backplans_{ch_id}"))
     if not text.isdigit() or int(text) < 1:
@@ -739,7 +814,7 @@ def process_redeem(message, ch_id, max_coins):
             reply_markup=markup)
         bot.register_next_step_handler(msg, process_redeem, ch_id, max_coins)
         return
-    minutes = coins_to_use * MINUTES_PER_COIN
+    minutes = coins_to_use * mpc
     ch_id_int = int(ch_id)
     try:
         expiry_datetime = datetime.now() + timedelta(minutes=minutes)
