@@ -255,11 +255,10 @@ def auto_approve(u_id, ch_id, mins, photo_file_id, user_name, price):
         )
         record_payment(u_id, user_name, ch_id, mins, price)
         bot.send_message(u_id,
-            f"🥳 *Payment Verified & Approved!*\n\n"
+            f"🥳 Payment Verified & Approved!\n\n"
             f"Subscription: {mins} Minutes\n\n"
             f"Join Link: {link.invite_link}\n\n"
-            f"⚠️ This link expires in {mins} minutes.",
-            parse_mode="Markdown")
+            f"⚠️ This link expires in {mins} minutes.")
         caption = (f"✅ *Auto Verified by Bot*\n\n"
                    f"User: {user_name} (`{u_id}`)\n"
                    f"Plan: {mins} Mins\n"
@@ -304,9 +303,8 @@ def start_handler(message):
                     try:
                         bot.send_message(referrer_id,
                             f"🎉 Someone joined using your referral link!\n\n"
-                            f"🪙 You earned *1 coin!*\n"
-                            f"Check your balance: tap 💰 Show My Coin Balance",
-                            parse_mode="Markdown")
+                            f"🪙 You earned 1 coin!\n"
+                            f"Check your balance: tap 💰 Show My Coin Balance")
                     except Exception:
                         pass
             ch_data = channels_col.find_one({"admin_id": ADMIN_ID})
@@ -449,18 +447,14 @@ def broadcast_start(message):
 
 def confirm_broadcast(message):
     broadcast_text = message.text.strip()
-
     markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("✅ Yes Send It", callback_data=f"confirmbc_yes"))
-    markup.add(InlineKeyboardButton("❌ Cancel", callback_data=f"confirmbc_no"))
-
-    # Save message temporarily in bot_state
+    markup.add(InlineKeyboardButton("✅ Yes Send It", callback_data="confirmbc_yes"))
+    markup.add(InlineKeyboardButton("❌ Cancel", callback_data="confirmbc_no"))
     bot_state_col.update_one(
         {"_id": "pending_broadcast"},
         {"$set": {"message": broadcast_text}},
         upsert=True
     )
-
     bot.send_message(ADMIN_ID,
         f"📢 *Preview of your broadcast:*\n\n"
         f"{broadcast_text}\n\n"
@@ -472,35 +466,26 @@ def confirm_broadcast(message):
 def handle_broadcast_confirm(call):
     action = call.data.split('_')[1]
     bot.answer_callback_query(call.id)
-
     if action == "no":
         bot.edit_message_text("❌ Broadcast cancelled.", call.message.chat.id, call.message.message_id)
         return
-
     pending = bot_state_col.find_one({"_id": "pending_broadcast"})
     if not pending:
         bot.send_message(ADMIN_ID, "❌ Broadcast message not found. Please try again.")
         return
-
     broadcast_text = pending['message']
     bot_state_col.delete_one({"_id": "pending_broadcast"})
-
     ch_data = channels_col.find_one({"admin_id": ADMIN_ID})
     bot_username = bot.get_me().username
-
     markup = None
     if ch_data:
         ch_link = f"https://t.me/{bot_username}?start={ch_data['channel_id']}"
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("🚀 Join Now!", url=ch_link))
-
     full_message = f"📢 *Message from Admin*\n\n{broadcast_text}"
-
     bot.edit_message_text("⏳ Broadcasting message to all users...",
                           call.message.chat.id, call.message.message_id)
-
     success, failed = broadcast_to_all(full_message, markup)
-
     bot.send_message(ADMIN_ID,
         f"✅ *Broadcast Complete!*\n\n"
         f"📨 Sent to: *{success}* users\n"
@@ -716,19 +701,19 @@ def show_referral(call):
     markup.add(InlineKeyboardButton("🔙 Back to Plans", callback_data=f"backplans_{ch_id}"))
     bot.answer_callback_query(call.id)
     bot.send_message(call.message.chat.id,
-        f"🎁 *FREE SUBSCRIPTION*\n\n"
-        f"Your personal referral link:\n`{ref_link}`\n\n"
-        f"📌 *How it works:*\n"
+        f"🎁 FREE SUBSCRIPTION\n\n"
+        f"Your personal referral link:\n{ref_link}\n\n"
+        f"📌 How it works:\n"
         f"→ Share your link with friends\n"
-        f"→ When a new friend opens the bot using your link you earn *1 coin*\n"
+        f"→ When a new friend opens the bot using your link you earn 1 coin\n"
         f"→ Each friend can only give you 1 coin\n"
         f"→ No purchase needed — anyone can earn!\n\n"
-        f"💰 *What is a coin worth?*\n"
+        f"💰 What is a coin worth?\n"
         f"→ 1 coin = {mpc} minutes free access\n"
         f"→ 5 coins = {5*mpc} minutes\n"
         f"→ 30 coins = {30*mpc} minutes\n"
         f"→ 720 coins = {720*mpc} minutes 🔥",
-        reply_markup=markup, parse_mode="Markdown")
+        reply_markup=markup)
 
 # --- COIN BALANCE ---
 
@@ -745,19 +730,19 @@ def show_coin_balance(call):
     markup.add(InlineKeyboardButton("🔙 Back to Plans", callback_data=f"backplans_{ch_id}"))
     bot.answer_callback_query(call.id)
     bot.send_message(call.message.chat.id,
-        f"💰 *Your Coin Balance*\n\n"
-        f"🪙 Coins: *{coins}*\n"
-        f"⏱ Worth: *{worth_minutes} minutes* of free access\n\n"
-        f"📌 *How to earn coins:*\n"
+        f"💰 Your Coin Balance\n\n"
+        f"🪙 Coins: {coins}\n"
+        f"⏱ Worth: {worth_minutes} minutes of free access\n\n"
+        f"📌 How to earn coins:\n"
         f"→ Share your referral link with friends\n"
         f"→ Each new friend who opens the bot = 1 coin\n"
         f"→ Each friend can only give you 1 coin\n\n"
-        f"💡 *Coin value:*\n"
+        f"💡 Coin value:\n"
         f"→ 1 coin = {mpc} minutes\n"
         f"→ 5 coins = {5*mpc} minutes\n"
         f"→ 30 coins = {30*mpc} minutes\n"
         f"→ 720 coins = {720*mpc} minutes 🔥",
-        reply_markup=markup, parse_mode="Markdown")
+        reply_markup=markup)
 
 # --- REDEEM COINS ---
 
@@ -775,24 +760,24 @@ def redeem_coins_start(call):
         markup.add(InlineKeyboardButton("🎁 FREE SUBSCRIPTION", callback_data=f"referral_{ch_id}"))
         markup.add(InlineKeyboardButton("🔙 Back to Plans", callback_data=f"backplans_{ch_id}"))
         bot.send_message(call.message.chat.id,
-            "🪙 *You have 0 coins*\n\n"
+            "🪙 You have 0 coins\n\n"
             "You don't have any coins yet!\n\n"
             "📌 Share your referral link with friends to earn coins and get free access!",
-            reply_markup=markup, parse_mode="Markdown")
+            reply_markup=markup)
         return
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("🔙 Cancel", callback_data=f"backplans_{ch_id}"))
     msg = bot.send_message(call.message.chat.id,
-        f"🎟 *Redeem Your Coins*\n\n"
-        f"You currently have *{coins} coins*\n"
-        f"Worth *{worth_minutes} minutes* of free access\n\n"
-        f"📌 *How redemption works:*\n"
+        f"🎟 Redeem Your Coins\n\n"
+        f"You currently have {coins} coins\n"
+        f"Worth {worth_minutes} minutes of free access\n\n"
+        f"📌 How redemption works:\n"
         f"→ Enter how many coins to redeem\n"
         f"→ Each coin = {mpc} minutes access\n"
         f"→ You'll get instant access to the channel\n"
         f"→ When time is up you'll be automatically removed\n\n"
         f"How many coins do you want to redeem? (max {coins})",
-        reply_markup=markup, parse_mode="Markdown")
+        reply_markup=markup)
     bot.register_next_step_handler(msg, process_redeem, ch_id, coins)
 
 def process_redeem(message, ch_id, max_coins):
@@ -827,12 +812,11 @@ def process_redeem(message, ch_id, max_coins):
             upsert=True
         )
         bot.send_message(message.chat.id,
-            f"🥳 *Access Granted!*\n\n"
+            f"🥳 Access Granted!\n\n"
             f"🪙 Coins used: {coins_to_use}\n"
             f"⏱ Access duration: {minutes} minutes\n\n"
             f"Join Link: {link.invite_link}\n\n"
-            f"⚠️ You will be automatically removed after {minutes} minutes.",
-            parse_mode="Markdown")
+            f"⚠️ You will be automatically removed after {minutes} minutes.")
         bot.send_message(ADMIN_ID,
             f"🪙 *Coin Redemption*\n\n"
             f"User: {user.first_name} (`{user.id}`)\n"
@@ -881,10 +865,10 @@ def user_pays(call):
     bot.send_photo(call.message.chat.id, qr_url,
         caption=(f"Plan: {mins} Minutes\n"
                  f"Price: ₹{price}\n"
-                 f"UPI ID: `{UPI_ID}`\n\n"
-                 f"⚠️ *Please pay exactly ₹{unique_amount}* — this unique amount helps us verify your payment automatically.\n\n"
+                 f"UPI ID: {UPI_ID}\n\n"
+                 f"⚠️ Please pay exactly ₹{unique_amount} — this unique amount helps us verify your payment automatically.\n\n"
                  f"After paying tap 'I Have Paid' below."),
-        reply_markup=markup, parse_mode="Markdown")
+        reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('paid_'))
 def request_proof(call):
@@ -935,12 +919,11 @@ def receive_proof(message, unique_amount):
     pending_payments[unique_amount]['photo_file_id'] = photo_file_id
     pending_payments[unique_amount]['timestamp'] = datetime.now()
     bot.send_message(message.chat.id,
-        "⏳ *Got your screenshot!*\n\n"
+        "⏳ Got your screenshot!\n\n"
         "The bot is now verifying your payment automatically.\n\n"
         "✅ If verified → invite link arrives within 1 minute.\n"
         "👨‍💼 If not → admin will review and approve manually.\n\n"
-        "Either way you're covered ❤️",
-        parse_mode="Markdown")
+        "Either way you're covered ❤️")
 
 # --- MANUAL APPROVAL ---
 
@@ -962,11 +945,10 @@ def approve_now(call):
             entry = pending_payments.pop(amount_key)
             record_payment(u_id, entry.get('user_name', 'Unknown'), ch_id, mins, entry.get('price', 0))
         bot.send_message(u_id,
-            f"🥳 *Payment Approved!*\n\n"
+            f"🥳 Payment Approved!\n\n"
             f"Subscription: {mins} Minutes\n\n"
             f"Join Link: {link.invite_link}\n\n"
-            f"⚠️ This link expires in {mins} minutes.",
-            parse_mode="Markdown")
+            f"⚠️ This link expires in {mins} minutes.")
         bot.edit_message_caption(
             f"✅ Manually approved by Admin\nUser: {u_id} | Plan: {mins} mins",
             call.message.chat.id, call.message.message_id)
