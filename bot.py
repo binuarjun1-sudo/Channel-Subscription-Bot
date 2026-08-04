@@ -120,6 +120,36 @@ def broadcast_to_all(message_text, extra_markup=None):
             failed += 1
     return success, failed
 
+# --- CHANNEL LIST (NEW) ---
+
+def show_channel_list(chat_id):
+    cursor = channels_col.find({"admin_id": ADMIN_ID})
+    channels = list(cursor)
+    if not channels:
+        bot.send_message(chat_id, "❌ No channels are available right now. Please contact the admin.")
+        return
+    markup = InlineKeyboardMarkup()
+    for ch in channels:
+        markup.add(InlineKeyboardButton(f"📢 {ch['name']}", callback_data=f"viewchannel_{ch['channel_id']}"))
+    bot.send_message(chat_id,
+        "👋 *Welcome!*\n\nPlease select a channel below to view its plans:",
+        reply_markup=markup, parse_mode="Markdown")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('viewchannel_'))
+def view_channel(call):
+    ch_id = int(call.data.split('_')[1])
+    ch_data = channels_col.find_one({"channel_id": ch_id})
+    bot.answer_callback_query(call.id)
+    if not ch_data:
+        bot.send_message(call.message.chat.id, "❌ Channel not found.")
+        return
+    show_plan_menu(call.message.chat.id, ch_id, ch_data)
+
+@bot.callback_query_handler(func=lambda call: call.data == "channellist_back")
+def channel_list_back(call):
+    bot.answer_callback_query(call.id)
+    show_channel_list(call.message.chat.id)
+
 def show_plan_menu(chat_id, ch_id, ch_data):
     markup = InlineKeyboardMarkup()
     for p_time, p_price in ch_data['plans'].items():
@@ -128,6 +158,7 @@ def show_plan_menu(chat_id, ch_id, ch_data):
     markup.add(InlineKeyboardButton("🎁 FREE SUBSCRIPTION", callback_data=f"referral_{ch_id}"))
     markup.add(InlineKeyboardButton("💰 Show My Coin Balance", callback_data=f"coinbalance_{ch_id}"))
     markup.add(InlineKeyboardButton("🎟 Redeem My Coins", callback_data=f"redeem_{ch_id}"))
+    markup.add(InlineKeyboardButton("🔙 All Channels", callback_data="channellist_back"))
     markup.add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
     desc = ch_data.get("description", "")
     welcome_text = f"Welcome!\n\nYou are joining: *{ch_data['name']}*"
@@ -315,10 +346,8 @@ def start_handler(message):
                             f"Check your balance: tap 💰 Show My Coin Balance")
                     except Exception:
                         pass
-            ch_data = channels_col.find_one({"admin_id": ADMIN_ID})
-            if ch_data:
-                show_plan_menu(message.chat.id, ch_data['channel_id'], ch_data)
-                return
+            show_channel_list(message.chat.id)
+            return
         else:
             try:
                 ch_id = int(param)
@@ -342,7 +371,7 @@ def start_handler(message):
             "/resume — Resume Bot & Notify Users",
             parse_mode="Markdown")
     else:
-        bot.send_message(message.chat.id, "Welcome! To join a channel, please use the link provided by the Admin.")
+        show_channel_list(message.chat.id)
 
 # --- STATS ---
 
@@ -483,13 +512,9 @@ def handle_broadcast_confirm(call):
         return
     broadcast_text = pending['message']
     bot_state_col.delete_one({"_id": "pending_broadcast"})
-    ch_data = channels_col.find_one({"admin_id": ADMIN_ID})
     bot_username = bot.get_me().username
-    markup = None
-    if ch_data:
-        ch_link = f"https://t.me/{bot_username}?start={ch_data['channel_id']}"
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🚀 Join Now!", url=ch_link))
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("🚀 View Channels", url=f"https://t.me/{bot_username}"))
     full_message = f"📢 *Message from Admin*\n\n{broadcast_text}"
     bot.edit_message_text("⏳ Broadcasting message to all users...",
                           call.message.chat.id, call.message.message_id)
@@ -579,13 +604,9 @@ def resume_bot(message):
 def confirm_resume(message):
     resume_msg = message.text.strip()
     set_bot_paused(False, "")
-    ch_data = channels_col.find_one({"admin_id": ADMIN_ID})
     bot_username = bot.get_me().username
-    markup = None
-    if ch_data:
-        ch_link = f"https://t.me/{bot_username}?start={ch_data['channel_id']}"
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🚀 Join Now!", url=ch_link))
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("🚀 View Channels", url=f"https://t.me/{bot_username}"))
     broadcast_text = (f"🟢 *Bot is Back Online!*\n\n"
                       f"{resume_msg}\n\n"
                       f"Tap the button below to join! 👇")
@@ -691,7 +712,9 @@ def finalize_channel(plan_state):
         summary = "\n".join(summary_lines)
         bot_username = bot.get_me().username
         bot.send_message(ADMIN_ID,
-            f"✅ Setup Successful!\n\nPlans for *{ch_name}*:\n{summary}\n\nInvite Link for users:\n`https://t.me/{bot_username}?start={ch_id}`",
+            f"✅ Setup Successful!\n\nPlans for *{ch_name}*:\n{summary}\n\n"
+            f"Users can now access this channel via your main bot link:\n`https://t.me/{bot_username}`\n\n"
+            f"Or this direct link:\n`https://t.me/{bot_username}?start={ch_id}`",
             parse_mode="Markdown")
     except Exception as e:
         bot.send_message(ADMIN_ID, f"❌ Something went wrong while saving: {e}")
@@ -1001,9 +1024,8 @@ def kick_expired_users():
         try:
             bot.ban_chat_member(user['channel_id'], user['user_id'])
             bot.unban_chat_member(user['channel_id'], user['user_id'])
-            rejoin_url = f"https://t.me/{bot_username}?start={user['channel_id']}"
             markup = InlineKeyboardMarkup()
-            markup.add(InlineKeyboardButton("🔄 Re-join / Renew", url=rejoin_url))
+            markup.add(InlineKeyboardButton("🔄 Re-join / Renew", url=f"https://t.me/{bot_username}"))
             markup.add(InlineKeyboardButton("🎟 Redeem My Coins", callback_data=f"redeem_{user['channel_id']}"))
             bot.send_message(user['user_id'],
                 "⚠️ Your subscription has expired.\n\n"
