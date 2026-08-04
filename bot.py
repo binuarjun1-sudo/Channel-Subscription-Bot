@@ -513,9 +513,8 @@ def handle_broadcast_confirm(call):
         return
     broadcast_text = pending['message']
     bot_state_col.delete_one({"_id": "pending_broadcast"})
-    bot_username = bot.get_me().username
     markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("🚀 View Channels", url=f"https://t.me/{bot_username}"))
+    markup.add(InlineKeyboardButton("🚀 View Channels", callback_data="channellist_back"))
     full_message = f"📢 *Message from Admin*\n\n{broadcast_text}"
     bot.edit_message_text("⏳ Broadcasting message to all users...",
                           call.message.chat.id, call.message.message_id)
@@ -561,7 +560,7 @@ def save_description(message, ch_id):
         f"📋 Preview:\n{desc}",
         parse_mode="Markdown")
 
-# --- DELETE CHANNEL (NEW) ---
+# --- DELETE CHANNEL ---
 
 @bot.message_handler(commands=['delete'], func=lambda m: m.from_user.id == ADMIN_ID)
 def delete_channel_start(message):
@@ -660,9 +659,8 @@ def resume_bot(message):
 def confirm_resume(message):
     resume_msg = message.text.strip()
     set_bot_paused(False, "")
-    bot_username = bot.get_me().username
     markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("🚀 View Channels", url=f"https://t.me/{bot_username}"))
+    markup.add(InlineKeyboardButton("🚀 View Channels", callback_data="channellist_back"))
     broadcast_text = (f"🟢 *Bot is Back Online!*\n\n"
                       f"{resume_msg}\n\n"
                       f"Tap the button below to join! 👇")
