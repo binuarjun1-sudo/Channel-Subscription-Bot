@@ -120,7 +120,7 @@ def broadcast_to_all(message_text, extra_markup=None):
             failed += 1
     return success, failed
 
-# --- CHANNEL LIST (NEW) ---
+# --- CHANNEL LIST ---
 
 def show_channel_list(chat_id):
     cursor = channels_col.find({"admin_id": ADMIN_ID})
@@ -362,6 +362,7 @@ def start_handler(message):
         bot.send_message(message.chat.id,
             "✅ *Admin Panel Active!*\n\n"
             "/add — Add/Edit Channel & Prices\n"
+            "/delete — Delete a Channel\n"
             "/channels — Manage Existing Channels\n"
             "/setdesc — Set Channel Description\n"
             "/stats — View Full Bot Statistics\n"
@@ -559,6 +560,61 @@ def save_description(message, ch_id):
         f"✅ Description saved for *{ch_data['name']}*!\n\n"
         f"📋 Preview:\n{desc}",
         parse_mode="Markdown")
+
+# --- DELETE CHANNEL (NEW) ---
+
+@bot.message_handler(commands=['delete'], func=lambda m: m.from_user.id == ADMIN_ID)
+def delete_channel_start(message):
+    cursor = channels_col.find({"admin_id": ADMIN_ID})
+    channels = list(cursor)
+    if not channels:
+        bot.send_message(ADMIN_ID, "❌ No channels found to delete.")
+        return
+    markup = InlineKeyboardMarkup()
+    for ch in channels:
+        markup.add(InlineKeyboardButton(f"🗑 {ch['name']}", callback_data=f"delselect_{ch['channel_id']}"))
+    bot.send_message(ADMIN_ID, "Which channel do you want to delete?", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('delselect_'))
+def delete_channel_confirm(call):
+    ch_id = int(call.data.split('_')[1])
+    ch_data = channels_col.find_one({"channel_id": ch_id})
+    bot.answer_callback_query(call.id)
+    if not ch_data:
+        bot.send_message(ADMIN_ID, "❌ Channel not found.")
+        return
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("✅ Yes, Delete It", callback_data=f"delconfirm_{ch_id}"))
+    markup.add(InlineKeyboardButton("❌ Cancel", callback_data="delcancel"))
+    bot.send_message(ADMIN_ID,
+        f"⚠️ *Are you sure you want to delete this channel?*\n\n"
+        f"📢 Channel: *{ch_data['name']}*\n\n"
+        f"This will remove it from the bot's channel list. New users won't be able to see or subscribe to it anymore.\n\n"
+        f"_Note: Existing active subscribers will keep their access until it naturally expires — they will not be kicked out._\n\n"
+        f"This cannot be undone.",
+        reply_markup=markup, parse_mode="Markdown")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('delconfirm_'))
+def delete_channel_final(call):
+    ch_id = int(call.data.split('_')[1])
+    ch_data = channels_col.find_one({"channel_id": ch_id})
+    bot.answer_callback_query(call.id)
+    if not ch_data:
+        bot.send_message(ADMIN_ID, "❌ Channel not found.")
+        return
+    ch_name = ch_data['name']
+    channels_col.delete_one({"channel_id": ch_id})
+    bot.edit_message_text(
+        f"✅ *Channel Deleted*\n\n"
+        f"📢 *{ch_name}* has been removed from the bot.\n\n"
+        f"It no longer appears in the channel list for new users.",
+        call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+
+@bot.callback_query_handler(func=lambda call: call.data == "delcancel")
+def delete_channel_cancel(call):
+    bot.answer_callback_query(call.id)
+    bot.edit_message_text("❌ Deletion cancelled. Channel was not removed.",
+                          call.message.chat.id, call.message.message_id)
 
 # --- PAUSE ---
 
