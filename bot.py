@@ -207,7 +207,7 @@ def check_gmail_payments():
             eid_str = eid.decode() if isinstance(eid, bytes) else eid
             if eid_str in processed_email_ids:
                 continue
-            _, msg_data = mail.fetch(eid, '(RFC822)')
+            _, msg_data = mail.fetch(eid, '(BODY.PEEK[])')
             msg = email.message_from_bytes(msg_data[0][1])
             subject = msg.get('subject', '')
             body = ""
