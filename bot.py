@@ -47,7 +47,7 @@ processed_emails_col = db['processed_emails']
 
 pending_payments = {}
 
-# --- PROCESSED EMAIL HELPERS (NOW PERSISTENT IN MONGODB) ---
+# --- PROCESSED EMAIL HELPERS (PERSISTENT IN MONGODB) ---
 
 def is_email_processed(eid_str):
     return processed_emails_col.find_one({"_id": eid_str}) is not None
@@ -324,6 +324,65 @@ def auto_approve(u_id, ch_id, mins, photo_file_id, user_name, price):
     except Exception as e:
         bot.send_message(ADMIN_ID, f"❌ Auto approval error for user {u_id}: {e}")
 
+# --- EMAIL STATS (NEW - READ ONLY) ---
+
+@bot.message_handler(commands=['emailstats'], func=lambda m: m.from_user.id == ADMIN_ID)
+def email_stats(message):
+    bot.send_message(ADMIN_ID, "🔍 Checking inbox... please wait.")
+    try:
+        mail = imaplib.IMAP4_SSL('imap.gmail.com')
+        mail.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+        mail.select('inbox')
+
+        _, total_data = mail.search(None, 'ALL')
+        total_count = len(total_data[0].split())
+
+        _, unseen_data = mail.search(None, 'UNSEEN')
+        unseen_count = len(unseen_data[0].split())
+
+        term_counts = {}
+        matching_ids = set()
+        for term in ['payment', 'debited', 'credited', 'UPI', 'received', 'paid']:
+            _, data = mail.search(None, f'(UNSEEN SUBJECT "{term}")')
+            ids = data[0].split()
+            term_counts[term] = len(ids)
+            matching_ids.update(ids)
+
+        matched_unread_count = len(matching_ids)
+
+        pending_processed_count = 0
+        for eid in matching_ids:
+            eid_str = eid.decode() if isinstance(eid, bytes) else eid
+            if not is_email_processed(eid_str):
+                pending_processed_count += 1
+
+        mail.logout()
+
+        total_processed_ever = processed_emails_col.count_documents({})
+
+        term_lines = "\n".join([f"→ '{term}': {count}" for term, count in term_counts.items()])
+
+        bot.send_message(ADMIN_ID,
+            f"📧 *Email Inbox Stats*\n\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"📥 *Inbox Overview*\n"
+            f"→ Total Emails: *{total_count}*\n"
+            f"→ Unread Emails: *{unseen_count}*\n\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"🔎 *Unread Matching Payment Keywords*\n"
+            f"{term_lines}\n"
+            f"→ Unique Total: *{matched_unread_count}*\n\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"⏳ *Not Yet Used by Bot*\n"
+            f"→ Awaiting a match: *{pending_processed_count}*\n\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"✅ *Bot History*\n"
+            f"→ Total Emails Ever Used to Approve: *{total_processed_ever}*\n\n"
+            f"_This command is read-only — nothing was changed or marked as read._",
+            parse_mode="Markdown")
+    except Exception as e:
+        bot.send_message(ADMIN_ID, f"❌ Error checking email stats: {e}")
+
 # --- START HANDLER ---
 
 @bot.message_handler(commands=['start'])
@@ -383,7 +442,8 @@ def start_handler(message):
             "/setcoin — Change Coin Value\n"
             "/broadcast — Broadcast Message to All Users\n"
             "/pause — Pause Bot & Notify Users\n"
-            "/resume — Resume Bot & Notify Users",
+            "/resume — Resume Bot & Notify Users\n"
+            "/emailstats — View Gmail Inbox Stats (read-only)",
             parse_mode="Markdown")
     else:
         show_channel_list(message.chat.id)
