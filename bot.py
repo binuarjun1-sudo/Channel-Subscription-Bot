@@ -43,9 +43,21 @@ coins_col = db['coins']
 all_users_col = db['all_users']
 payments_col = db['payments']
 bot_state_col = db['bot_state']
+processed_emails_col = db['processed_emails']
 
 pending_payments = {}
-processed_email_ids = set()
+
+# --- PROCESSED EMAIL HELPERS (NOW PERSISTENT IN MONGODB) ---
+
+def is_email_processed(eid_str):
+    return processed_emails_col.find_one({"_id": eid_str}) is not None
+
+def mark_email_processed(eid_str):
+    processed_emails_col.update_one(
+        {"_id": eid_str},
+        {"$set": {"processed_at": datetime.now()}},
+        upsert=True
+    )
 
 # --- BOT STATE HELPERS ---
 
@@ -205,7 +217,7 @@ def check_gmail_payments():
         print(f"[Gmail Check] Found {len(email_ids)} unseen matching emails")
         for eid in email_ids:
             eid_str = eid.decode() if isinstance(eid, bytes) else eid
-            if eid_str in processed_email_ids:
+            if is_email_processed(eid_str):
                 continue
             _, msg_data = mail.fetch(eid, '(BODY.PEEK[])')
             msg = email.message_from_bytes(msg_data[0][1])
@@ -233,9 +245,11 @@ def check_gmail_payments():
             if amount_key in pending_payments:
                 print(f"[Gmail Check] MATCH FOUND for amount {amount_key}, auto-approving")
                 entry = pending_payments.pop(amount_key)
-                processed_email_ids.add(eid_str)
-                if len(processed_email_ids) > 500:
-                    processed_email_ids.clear()
+                mark_email_processed(eid_str)
+                try:
+                    mail.store(eid, '+FLAGS', '\\Seen')
+                except Exception as e:
+                    print(f"[Gmail Check] Could not mark as seen: {e}")
                 auto_approve(
                     entry['user_id'], entry['ch_id'], int(entry['mins']),
                     entry.get('photo_file_id'), entry.get('user_name', 'Unknown'), entry['price']
