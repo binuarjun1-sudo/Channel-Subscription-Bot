@@ -2,6 +2,7 @@ import os
 import re
 import imaplib
 import email
+import email.utils
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pymongo import MongoClient
@@ -59,6 +60,19 @@ def mark_email_processed(eid_str):
         upsert=True
     )
 
+def get_email_datetime(msg):
+    """Parse the email's Date header into a naive local datetime. Returns None if unavailable."""
+    date_str = msg.get('Date')
+    if not date_str:
+        return None
+    try:
+        dt = email.utils.parsedate_to_datetime(date_str)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone().replace(tzinfo=None)
+        return dt
+    except Exception:
+        return None
+
 # --- BOT STATE HELPERS ---
 
 def get_minutes_per_coin():
@@ -113,7 +127,7 @@ def get_coin_data(user_id):
 
 def get_unique_amount(base_price):
     base = int(base_price)
-    for offset in range(1, 10):
+    for offset in range(1, 50):
         unique = base + offset
         if unique not in pending_payments:
             return unique
@@ -219,7 +233,7 @@ def check_gmail_payments():
             eid_str = eid.decode() if isinstance(eid, bytes) else eid
             if is_email_processed(eid_str):
                 continue
-            _, msg_data = mail.fetch(eid, '(RFC822)')
+            _, msg_data = mail.fetch(eid, '(BODY.PEEK[])')
             msg = email.message_from_bytes(msg_data[0][1])
             subject = msg.get('subject', '')
             body = ""
@@ -243,6 +257,15 @@ def check_gmail_payments():
                 continue
             amount_key = int(amount)
             if amount_key in pending_payments:
+                # SECURITY CHECK: the email must have arrived AFTER the user picked the plan
+                # (not after the screenshot). Stops old emails from approving newer payments.
+                email_dt = get_email_datetime(msg)
+                entry_peek = pending_payments[amount_key]
+                pending_created = entry_peek.get('created_at', entry_peek['timestamp'])
+                if email_dt is not None and email_dt < (pending_created - timedelta(minutes=5)):
+                    print(f"[Gmail Check] Email for amount {amount_key} is OLDER than the pending payment "
+                          f"(email: {email_dt}, pending created: {pending_created}). Skipping.")
+                    continue
                 print(f"[Gmail Check] MATCH FOUND for amount {amount_key}, auto-approving")
                 entry = pending_payments.pop(amount_key)
                 mark_email_processed(eid_str)
@@ -252,7 +275,8 @@ def check_gmail_payments():
                     print(f"[Gmail Check] Could not mark as seen: {e}")
                 auto_approve(
                     entry['user_id'], entry['ch_id'], int(entry['mins']),
-                    entry.get('photo_file_id'), entry.get('user_name', 'Unknown'), entry['price']
+                    entry.get('photo_file_id'), entry.get('user_name', 'Unknown'), entry['price'],
+                    entry.get('admin_msg_id')
                 )
             else:
                 print(f"[Gmail Check] Amount {amount_key} extracted but no matching pending payment")
@@ -260,29 +284,6 @@ def check_gmail_payments():
         print(f"[Gmail Check] Finished successfully")
     except Exception as e:
         print(f"Gmail IMAP error: {e}")
-
-def check_fallback_payments():
-    now = datetime.now()
-    for amount_key, data in list(pending_payments.items()):
-        if not data.get('photo_file_id'):
-            continue
-        if data.get('fallback_sent'):
-            continue
-        elapsed = (now - data['timestamp']).total_seconds()
-        if elapsed >= 120:
-            try:
-                markup = InlineKeyboardMarkup()
-                markup.add(InlineKeyboardButton("✅ Approve", callback_data=f"app_{data['user_id']}_{data['ch_id']}_{data['mins']}_{amount_key}"))
-                markup.add(InlineKeyboardButton("❌ Reject", callback_data=f"rej_{data['user_id']}_{amount_key}"))
-                caption = (f"⚠️ *Manual Verification Required*\n"
-                           f"_(Bot could not auto-verify)_\n\n"
-                           f"User: {data['user_name']} (`{data['user_id']}`)\n"
-                           f"Plan: {data['mins']} Mins\n"
-                           f"Amount: ₹{amount_key} (base ₹{data['price']})")
-                bot.send_photo(ADMIN_ID, data['photo_file_id'], caption=caption, reply_markup=markup, parse_mode="Markdown")
-                pending_payments[amount_key]['fallback_sent'] = True
-            except Exception as e:
-                print(f"Fallback error: {e}")
 
 def record_payment(u_id, user_name, ch_id, mins, price):
     today = datetime.now().strftime("%Y-%m-%d")
@@ -296,7 +297,7 @@ def record_payment(u_id, user_name, ch_id, mins, price):
         "timestamp": datetime.now()
     })
 
-def auto_approve(u_id, ch_id, mins, photo_file_id, user_name, price):
+def auto_approve(u_id, ch_id, mins, photo_file_id, user_name, price, admin_msg_id=None):
     try:
         expiry_datetime = datetime.now() + timedelta(minutes=mins)
         expiry_ts = int(expiry_datetime.timestamp())
@@ -312,19 +313,28 @@ def auto_approve(u_id, ch_id, mins, photo_file_id, user_name, price):
             f"Subscription: {mins} Minutes\n\n"
             f"Join Link: {link.invite_link}\n\n"
             f"⚠️ This link expires in {mins} minutes.")
-        caption = (f"✅ *Auto Verified by Bot*\n\n"
-                   f"User: {user_name} (`{u_id}`)\n"
+        caption = (f"✅ Auto Verified by Bot\n\n"
+                   f"User: {user_name} ({u_id})\n"
                    f"Plan: {mins} Mins\n"
                    f"Amount: ₹{price}\n\n"
-                   f"_No action needed — invite link already sent._")
-        if photo_file_id:
-            bot.send_photo(ADMIN_ID, photo_file_id, caption=caption, parse_mode="Markdown")
-        else:
-            bot.send_message(ADMIN_ID, caption, parse_mode="Markdown")
+                   f"No action needed — invite link already sent.")
+        updated = False
+        if admin_msg_id:
+            try:
+                # Update the message that was already sent to admin (buttons are removed)
+                bot.edit_message_caption(caption, chat_id=ADMIN_ID, message_id=admin_msg_id)
+                updated = True
+            except Exception as e:
+                print(f"[Auto Approve] Could not edit admin message: {e}")
+        if not updated:
+            if photo_file_id:
+                bot.send_photo(ADMIN_ID, photo_file_id, caption=caption)
+            else:
+                bot.send_message(ADMIN_ID, caption)
     except Exception as e:
         bot.send_message(ADMIN_ID, f"❌ Auto approval error for user {u_id}: {e}")
 
-# --- EMAIL STATS (NEW - READ ONLY) ---
+# --- EMAIL STATS (READ ONLY) ---
 
 @bot.message_handler(commands=['emailstats'], func=lambda m: m.from_user.id == ADMIN_ID)
 def email_stats(message):
@@ -1007,15 +1017,17 @@ def user_pays(call):
     price = ch_data['plans'][mins]
     unique_amount = get_unique_amount(price)
     qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=upi://pay?pa={UPI_ID}%26am={unique_amount}%26cu=INR"
+    now = datetime.now()
     pending_payments[unique_amount] = {
         "user_id": call.from_user.id,
         "user_name": call.from_user.first_name,
         "ch_id": int(ch_id),
         "mins": mins,
         "price": price,
-        "timestamp": datetime.now(),
+        "created_at": now,
+        "timestamp": now,
         "photo_file_id": None,
-        "fallback_sent": False
+        "admin_msg_id": None
     }
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("✅ I Have Paid", callback_data=f"paid_{ch_id}_{mins}_{unique_amount}"))
@@ -1060,6 +1072,25 @@ def cancel_proof(call):
         return
     show_plan_menu(call.message.chat.id, ch_id, ch_data)
 
+def send_proof_to_admin(unique_amount, data):
+    """Instantly send the screenshot to the admin with Approve/Reject buttons.
+    Returns the admin message id (so it can be updated later), or None."""
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("✅ Approve", callback_data=f"app_{data['user_id']}_{data['ch_id']}_{data['mins']}_{unique_amount}"))
+    markup.add(InlineKeyboardButton("❌ Reject", callback_data=f"rej_{data['user_id']}_{unique_amount}"))
+    caption = (f"🔔 New Payment Proof (auto-check running...)\n\n"
+               f"User: {data['user_name']} ({data['user_id']})\n"
+               f"Plan: {data['mins']} Mins\n"
+               f"Amount to match: ₹{unique_amount} (base ₹{data['price']})\n\n"
+               f"If Gmail confirms it, this message updates automatically. "
+               f"Otherwise verify the screenshot and tap Approve or Reject.")
+    try:
+        sent = bot.send_photo(ADMIN_ID, data['photo_file_id'], caption=caption, reply_markup=markup)
+        return sent.message_id
+    except Exception as e:
+        print(f"[Admin Notify] Failed to send proof to admin: {e}")
+        return None
+
 def receive_proof(message, unique_amount):
     user = message.from_user
     if unique_amount not in pending_payments:
@@ -1079,10 +1110,14 @@ def receive_proof(message, unique_amount):
     pending_payments[unique_amount]['timestamp'] = datetime.now()
     bot.send_message(message.chat.id,
         "⏳ Got your screenshot!\n\n"
-        "The bot is now verifying your payment automatically.\n\n"
+        "The bot is verifying your payment automatically, and the admin has also been notified.\n\n"
         "✅ If verified → invite link arrives within 1 minute.\n"
-        "👨‍💼 If not → admin will review and approve manually.\n\n"
+        "👨‍💼 If not → admin will approve manually.\n\n"
         "Either way you're covered ❤️")
+    # Instantly notify the admin (auto-verification keeps running in the background)
+    admin_msg_id = send_proof_to_admin(unique_amount, pending_payments[unique_amount])
+    if unique_amount in pending_payments:
+        pending_payments[unique_amount]['admin_msg_id'] = admin_msg_id
 
 # --- MANUAL APPROVAL ---
 
@@ -1091,6 +1126,23 @@ def approve_now(call):
     parts = call.data.split('_')
     u_id, ch_id, mins = int(parts[1]), int(parts[2]), int(parts[3])
     amount_key = int(parts[4]) if len(parts) > 4 else None
+
+    # Guard: if this payment is no longer pending, check whether it was already approved
+    if amount_key is not None and amount_key not in pending_payments:
+        recent = payments_col.find_one({
+            "user_id": u_id,
+            "channel_id": ch_id,
+            "timestamp": {"$gte": datetime.now() - timedelta(minutes=30)}
+        })
+        if recent:
+            bot.answer_callback_query(call.id, "Already approved (auto-verified or approved earlier).", show_alert=True)
+            try:
+                bot.edit_message_caption("✅ Already approved earlier.", call.message.chat.id, call.message.message_id)
+            except Exception:
+                pass
+            return
+
+    bot.answer_callback_query(call.id)
     try:
         expiry_datetime = datetime.now() + timedelta(minutes=mins)
         expiry_ts = int(expiry_datetime.timestamp())
@@ -1103,6 +1155,9 @@ def approve_now(call):
         if amount_key and amount_key in pending_payments:
             entry = pending_payments.pop(amount_key)
             record_payment(u_id, entry.get('user_name', 'Unknown'), ch_id, mins, entry.get('price', 0))
+        elif amount_key:
+            # Bot restarted and lost the pending entry; still record the payment
+            record_payment(u_id, "Unknown", ch_id, mins, amount_key)
         bot.send_message(u_id,
             f"🥳 Payment Approved!\n\n"
             f"Subscription: {mins} Minutes\n\n"
@@ -1119,6 +1174,22 @@ def reject_payment(call):
     parts = call.data.split('_')
     u_id = int(parts[1])
     amount_key = int(parts[2]) if len(parts) > 2 else None
+
+    # Guard: don't reject a payment that was already auto-approved
+    if amount_key is not None and amount_key not in pending_payments:
+        recent = payments_col.find_one({
+            "user_id": u_id,
+            "timestamp": {"$gte": datetime.now() - timedelta(minutes=30)}
+        })
+        if recent:
+            bot.answer_callback_query(call.id, "This payment was already approved.", show_alert=True)
+            try:
+                bot.edit_message_caption("✅ Already approved earlier.", call.message.chat.id, call.message.message_id)
+            except Exception:
+                pass
+            return
+
+    bot.answer_callback_query(call.id)
     if amount_key:
         pending_payments.pop(amount_key, None)
     try:
@@ -1128,9 +1199,12 @@ def reject_payment(call):
                 InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}")))
     except Exception:
         pass
-    bot.edit_message_caption(
-        f"❌ Rejected by Admin\nUser: {u_id}",
-        call.message.chat.id, call.message.message_id)
+    try:
+        bot.edit_message_caption(
+            f"❌ Rejected by Admin\nUser: {u_id}",
+            call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('manage_'))
 def manage_ch(call):
@@ -1169,7 +1243,6 @@ if __name__ == '__main__':
     scheduler = BackgroundScheduler()
     scheduler.add_job(kick_expired_users, 'interval', minutes=1)
     scheduler.add_job(check_gmail_payments, 'interval', minutes=1)
-    scheduler.add_job(check_fallback_payments, 'interval', minutes=1)
     scheduler.start()
     bot.remove_webhook()
     print("Bot is running...")
