@@ -1,15 +1,18 @@
 import os
 import re
+import time
 import imaplib
 import email
 import email.utils
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from telebot.apihelper import ApiTelegramException
 from pymongo import MongoClient
 from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask
-from threading import Thread
+from threading import Thread, Lock
 
 # --- RENDER KEEP-ALIVE SERVER ---
 app = Flask('')
@@ -34,6 +37,10 @@ GMAIL_APP_PASSWORD = os.getenv('GMAIL_APP_PASSWORD')
 
 COINS_PER_REFERRAL = 1
 DEFAULT_MINUTES_PER_COIN = 2
+
+# Broadcast speed settings
+BROADCAST_WORKERS = 20          # parallel senders
+BROADCAST_MAX_PER_SECOND = 25   # stay under Telegram's ~30 msgs/sec limit
 
 bot = telebot.TeleBot(BOT_TOKEN)
 client = MongoClient(MONGO_URI)
@@ -133,18 +140,126 @@ def get_unique_amount(base_price):
             return unique
     return base + 1
 
-def broadcast_to_all(message_text, extra_markup=None):
-    all_users = all_users_col.find({})
-    success = 0
-    failed = 0
-    for user in all_users:
+# --- FAST BROADCAST ENGINE ---
+
+_rate_lock = Lock()
+_last_send_time = [0.0]
+
+def _throttle():
+    """Spaces out sends so we never exceed BROADCAST_MAX_PER_SECOND."""
+    interval = 1.0 / BROADCAST_MAX_PER_SECOND
+    with _rate_lock:
+        now = time.time()
+        next_allowed = _last_send_time[0] + interval
+        if next_allowed > now:
+            time.sleep(next_allowed - now)
+            now = next_allowed
+        _last_send_time[0] = now
+
+def _send_one(user_id, text, markup):
+    """Sends one message. Returns 'ok', 'dead' (blocked/deleted), or 'failed' (temporary)."""
+    for attempt in range(3):
         try:
-            bot.send_message(user['user_id'], message_text,
-                             reply_markup=extra_markup, parse_mode="Markdown")
-            success += 1
+            _throttle()
+            bot.send_message(user_id, text, reply_markup=markup, parse_mode="Markdown")
+            return "ok"
+        except ApiTelegramException as e:
+            code = e.error_code
+            desc = str(e.description).lower()
+            if code == 429:
+                wait = 5
+                try:
+                    wait = int(e.result_json.get('parameters', {}).get('retry_after', 5))
+                except Exception:
+                    pass
+                time.sleep(wait + 1)
+                continue
+            if code == 403:
+                return "dead"
+            if code == 400 and "chat not found" in desc:
+                return "dead"
+            if code == 400 and "parse" in desc:
+                # Formatting problem in the message: retry once as plain text
+                try:
+                    _throttle()
+                    bot.send_message(user_id, text, reply_markup=markup)
+                    return "ok"
+                except ApiTelegramException as e2:
+                    if e2.error_code == 403:
+                        return "dead"
+                    return "failed"
+                except Exception:
+                    return "failed"
+            return "failed"
         except Exception:
-            failed += 1
-    return success, failed
+            time.sleep(1)
+            continue
+    return "failed"
+
+def broadcast_to_all(message_text, extra_markup=None, status_msg_id=None):
+    """Sends to all users in parallel. Removes blocked/deleted users from the list.
+    Returns (delivered, failed, removed)."""
+    user_ids = [u['user_id'] for u in all_users_col.find({}, {"user_id": 1})]
+    total = len(user_ids)
+    delivered = 0
+    failed = 0
+    dead_ids = []
+    done = 0
+    last_update = time.time()
+
+    if total == 0:
+        return 0, 0, 0
+
+    with ThreadPoolExecutor(max_workers=BROADCAST_WORKERS) as executor:
+        futures = {executor.submit(_send_one, uid, message_text, extra_markup): uid for uid in user_ids}
+        for future in as_completed(futures):
+            uid = futures[future]
+            try:
+                result = future.result()
+            except Exception:
+                result = "failed"
+            if result == "ok":
+                delivered += 1
+            elif result == "dead":
+                dead_ids.append(uid)
+            else:
+                failed += 1
+            done += 1
+            if status_msg_id and (time.time() - last_update) >= 4:
+                last_update = time.time()
+                try:
+                    bot.edit_message_text(f"⏳ Sending... {done}/{total}", ADMIN_ID, status_msg_id)
+                except Exception:
+                    pass
+
+    removed = 0
+    if dead_ids:
+        try:
+            result = all_users_col.delete_many({"user_id": {"$in": dead_ids}})
+            removed = result.deleted_count
+        except Exception as e:
+            print(f"[Broadcast] Could not remove dead users: {e}")
+    return delivered, failed, removed
+
+def run_broadcast_job(text, markup, status_msg_id, title, footer=""):
+    """Runs a broadcast in the background so the bot stays responsive."""
+    def job():
+        try:
+            delivered, failed, removed = broadcast_to_all(text, markup, status_msg_id)
+            report = (f"{title}\n\n"
+                      f"📨 Delivered: *{delivered}*\n"
+                      f"🗑 Removed (blocked/deleted): *{removed}*\n"
+                      f"⚠️ Failed (temporary): *{failed}*")
+            if footer:
+                report += f"\n\n{footer}"
+            bot.send_message(ADMIN_ID, report, parse_mode="Markdown")
+        except Exception as e:
+            print(f"[Broadcast] Job error: {e}")
+            try:
+                bot.send_message(ADMIN_ID, f"❌ Broadcast error: {e}")
+            except Exception:
+                pass
+    Thread(target=job, daemon=True).start()
 
 # --- CHANNEL LIST ---
 
@@ -600,15 +715,10 @@ def handle_broadcast_confirm(call):
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("🚀 View Channels", callback_data="channellist_back"))
     full_message = f"📢 *Message from Admin*\n\n{broadcast_text}"
-    bot.edit_message_text("⏳ Broadcasting message to all users...",
+    bot.edit_message_text("⏳ Broadcast started... sending to all users.",
                           call.message.chat.id, call.message.message_id)
-    success, failed = broadcast_to_all(full_message, markup)
-    bot.send_message(ADMIN_ID,
-        f"✅ *Broadcast Complete!*\n\n"
-        f"📨 Sent to: *{success}* users\n"
-        f"❌ Failed: *{failed}* users\n\n"
-        f"_(Failed users may have blocked the bot)_",
-        parse_mode="Markdown")
+    run_broadcast_job(full_message, markup, call.message.message_id,
+                      "✅ *Broadcast Complete!*")
 
 # --- SET DESCRIPTION ---
 
@@ -718,14 +828,10 @@ def confirm_pause(message):
     broadcast_text = (f"🔴 *Bot Paused*\n\n"
                       f"{pause_msg}\n\n"
                       f"Please check back later.")
-    bot.send_message(ADMIN_ID, "⏳ Broadcasting pause message to all users...")
-    success, failed = broadcast_to_all(broadcast_text)
-    bot.send_message(ADMIN_ID,
-        f"✅ *Bot Paused Successfully!*\n\n"
-        f"📨 Broadcast sent to *{success}* users\n"
-        f"❌ Failed for *{failed}* users\n\n"
-        f"Use /resume when ready.",
-        parse_mode="Markdown")
+    status = bot.send_message(ADMIN_ID, "⏳ Broadcasting pause message to all users...")
+    run_broadcast_job(broadcast_text, None, status.message_id,
+                      "✅ *Bot Paused Successfully!*",
+                      "Use /resume when ready.")
 
 # --- RESUME ---
 
@@ -748,14 +854,10 @@ def confirm_resume(message):
     broadcast_text = (f"🟢 *Bot is Back Online!*\n\n"
                       f"{resume_msg}\n\n"
                       f"Tap the button below to join! 👇")
-    bot.send_message(ADMIN_ID, "⏳ Broadcasting resume message to all users...")
-    success, failed = broadcast_to_all(broadcast_text, markup)
-    bot.send_message(ADMIN_ID,
-        f"✅ *Bot Resumed Successfully!*\n\n"
-        f"📨 Broadcast sent to *{success}* users\n"
-        f"❌ Failed for *{failed}* users\n\n"
-        f"Bot is now fully operational! ✅",
-        parse_mode="Markdown")
+    status = bot.send_message(ADMIN_ID, "⏳ Broadcasting resume message to all users...")
+    run_broadcast_job(broadcast_text, markup, status.message_id,
+                      "✅ *Bot Resumed Successfully!*",
+                      "Bot is now fully operational! ✅")
 
 # --- ADMIN CHANNEL MANAGEMENT ---
 
