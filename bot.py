@@ -5,6 +5,8 @@ import imaplib
 import email
 import email.utils
 import telebot
+from decimal import Decimal
+from email.header import decode_header, make_header
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from telebot.apihelper import ApiTelegramException
 from pymongo import MongoClient
@@ -42,6 +44,11 @@ DEFAULT_MINUTES_PER_COIN = 2
 BROADCAST_WORKERS = 20          # parallel senders
 BROADCAST_MAX_PER_SECOND = 25   # stay under Telegram's ~30 msgs/sec limit
 
+# Unique-amount settings: the buyer pays price + 0.01 ... price + 0.99
+AMOUNT_SLOTS = 99
+UNPAID_HOLD_MINUTES = 360       # 6 hours: reservation kept if no screenshot yet
+PROOF_HOLD_MINUTES = 1440       # 24 hours: reservation kept after a screenshot was sent
+
 bot = telebot.TeleBot(BOT_TOKEN)
 client = MongoClient(MONGO_URI)
 db = client['sub_management']
@@ -53,7 +60,36 @@ payments_col = db['payments']
 bot_state_col = db['bot_state']
 processed_emails_col = db['processed_emails']
 
+# Key = amount in PAISE (e.g. ₹100.01 -> 10001)
 pending_payments = {}
+_reserve_lock = Lock()
+_last_offset = {}
+
+# --- DISPLAY HELPERS ---
+
+def duration_label(mins):
+    """1440 -> '1 Day', 10080 -> '7 Days', 90 -> '1 Hour 30 Minutes'."""
+    mins = int(mins)
+    days, rem = divmod(mins, 1440)
+    hours, minutes = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days} Day" + ("s" if days != 1 else ""))
+    if hours:
+        parts.append(f"{hours} Hour" + ("s" if hours != 1 else ""))
+    if minutes:
+        parts.append(f"{minutes} Minute" + ("s" if minutes != 1 else ""))
+    return " ".join(parts) if parts else f"{mins} Minutes"
+
+def fmt_amount(paise):
+    """10001 -> '100.01'. Small numbers are old whole-rupee amounts from before the update."""
+    paise = int(paise)
+    if paise < 100:
+        return str(paise)
+    return f"{paise // 100}.{paise % 100:02d}"
+
+def to_paise(amount):
+    return int((Decimal(amount) * 100).to_integral_value())
 
 # --- PROCESSED EMAIL HELPERS (PERSISTENT IN MONGODB) ---
 
@@ -79,6 +115,13 @@ def get_email_datetime(msg):
         return dt
     except Exception:
         return None
+
+def decode_subject(msg):
+    raw = msg.get('subject', '') or ''
+    try:
+        return str(make_header(decode_header(raw)))
+    except Exception:
+        return raw
 
 # --- BOT STATE HELPERS ---
 
@@ -132,13 +175,80 @@ def get_coin_data(user_id):
         data = coins_col.find_one({"user_id": user_id})
     return data
 
-def get_unique_amount(base_price):
-    base = int(base_price)
-    for offset in range(1, 50):
-        unique = base + offset
-        if unique not in pending_payments:
-            return unique
-    return base + 1
+# --- UNIQUE AMOUNT HANDLING (PAISE) ---
+
+def owns_pending(amount_key, user_id):
+    """True only if this amount is currently reserved by this same user."""
+    entry = pending_payments.get(amount_key)
+    return bool(entry and entry.get('user_id') == user_id)
+
+def reserve_amount(price, user_id, user_name, ch_id, mins):
+    """Reserves price + 0.01 ... price + 0.99 for this buyer and returns it in paise.
+    - Same user + same plan tapping again gets the same amount back.
+    - Amounts go up in order (.01, .02, .03 ...), skipping ones in use.
+    - If all 99 are taken, the oldest reservation that has no screenshot is reused.
+    - Returns None only if all 99 are waiting on a screenshot (very rare)."""
+    base_price = int(price)
+    base_paise = base_price * 100
+    now = datetime.now()
+    with _reserve_lock:
+        for amt, d in list(pending_payments.items()):
+            if (d.get('user_id') == user_id and d.get('ch_id') == int(ch_id)
+                    and str(d.get('mins')) == str(mins) and int(d.get('price', -1)) == base_price):
+                d['last_touch'] = now
+                return amt
+
+        chosen = None
+        start = _last_offset.get(base_paise, 0)
+        for i in range(1, AMOUNT_SLOTS + 1):
+            n = ((start + i - 1) % AMOUNT_SLOTS) + 1
+            key = base_paise + n
+            if key not in pending_payments:
+                chosen = key
+                _last_offset[base_paise] = n
+                break
+
+        if chosen is None:
+            unpaid = [(d.get('last_touch', d['created_at']), amt)
+                      for amt, d in list(pending_payments.items())
+                      if base_paise < amt <= base_paise + AMOUNT_SLOTS and not d.get('photo_file_id')]
+            if unpaid:
+                chosen = min(unpaid)[1]
+                pending_payments.pop(chosen, None)
+
+        if chosen is None:
+            return None
+
+        pending_payments[chosen] = {
+            "user_id": user_id,
+            "user_name": user_name,
+            "ch_id": int(ch_id),
+            "mins": mins,
+            "price": price,
+            "created_at": now,
+            "last_touch": now,
+            "timestamp": now,
+            "photo_file_id": None,
+            "admin_msg_id": None
+        }
+        return chosen
+
+def cleanup_expired_payments():
+    """Frees amounts that were reserved long ago and never completed."""
+    now = datetime.now()
+    for amount_key, data in list(pending_payments.items()):
+        try:
+            if data.get('photo_file_id'):
+                age = (now - data['timestamp']).total_seconds()
+                limit = PROOF_HOLD_MINUTES * 60
+            else:
+                age = (now - data.get('last_touch', data['created_at'])).total_seconds()
+                limit = UNPAID_HOLD_MINUTES * 60
+            if age > limit:
+                pending_payments.pop(amount_key, None)
+                print(f"[Cleanup] Released unused amount ₹{fmt_amount(amount_key)}")
+        except Exception as e:
+            print(f"[Cleanup] Error: {e}")
 
 # --- FAST BROADCAST ENGINE ---
 
@@ -294,7 +404,7 @@ def channel_list_back(call):
 def show_plan_menu(chat_id, ch_id, ch_data):
     markup = InlineKeyboardMarkup()
     for p_time, p_price in ch_data['plans'].items():
-        label = f"{p_time} Min" if int(p_time) < 60 else f"{int(p_time)//1440} Days"
+        label = duration_label(p_time)
         markup.add(InlineKeyboardButton(f"💳 {label} - ₹{p_price}", callback_data=f"select_{ch_id}_{p_time}"))
     markup.add(InlineKeyboardButton("🎁 FREE SUBSCRIPTION", callback_data=f"referral_{ch_id}"))
     markup.add(InlineKeyboardButton("💰 Show My Coin Balance", callback_data=f"coinbalance_{ch_id}"))
@@ -311,21 +421,22 @@ def show_plan_menu(chat_id, ch_id, ch_data):
 # --- GMAIL IMAP ---
 
 def extract_amount_from_text(text):
+    """Returns the amount found in the text as a Decimal (keeps the paise), or None."""
     patterns = [
-        r'(?:rs\.?|inr|₹)\s*(\d+(?:\.\d{1,2})?)',
-        r'(\d+(?:\.\d{1,2})?)\s*(?:rs\.?|inr|₹)',
-        r'amount.*?(\d+(?:\.\d{1,2})?)',
-        r'paid.*?(\d+(?:\.\d{1,2})?)',
-        r'debited.*?(\d+(?:\.\d{1,2})?)',
-        r'received.*?(\d+(?:\.\d{1,2})?)',
-        r'credited.*?(\d+(?:\.\d{1,2})?)',
+        r'(?:rs\.?|inr|₹)\s*(\d[\d,]*(?:\.\d{1,2})?)',
+        r'(\d[\d,]*(?:\.\d{1,2})?)\s*(?:rs\.?|inr|₹)',
+        r'amount.*?(\d[\d,]*(?:\.\d{1,2})?)',
+        r'paid.*?(\d[\d,]*(?:\.\d{1,2})?)',
+        r'debited.*?(\d[\d,]*(?:\.\d{1,2})?)',
+        r'received.*?(\d[\d,]*(?:\.\d{1,2})?)',
+        r'credited.*?(\d[\d,]*(?:\.\d{1,2})?)',
     ]
     text_lower = text.lower()
     for pattern in patterns:
         match = re.search(pattern, text_lower)
         if match:
             try:
-                return float(match.group(1))
+                return Decimal(match.group(1).replace(',', ''))
             except Exception:
                 continue
     return None
@@ -333,7 +444,7 @@ def extract_amount_from_text(text):
 def check_gmail_payments():
     if not pending_payments:
         return
-    print(f"[Gmail Check] Started. Pending payments: {list(pending_payments.keys())}")
+    print(f"[Gmail Check] Started. Pending payments: {[fmt_amount(k) for k in pending_payments.keys()]}")
     try:
         mail = imaplib.IMAP4_SSL('imap.gmail.com')
         mail.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
@@ -350,7 +461,7 @@ def check_gmail_payments():
                 continue
             _, msg_data = mail.fetch(eid, '(BODY.PEEK[])')
             msg = email.message_from_bytes(msg_data[0][1])
-            subject = msg.get('subject', '')
+            subject = decode_subject(msg)
             body = ""
             if msg.is_multipart():
                 for part in msg.walk():
@@ -370,19 +481,21 @@ def check_gmail_payments():
             if amount is None:
                 print(f"[Gmail Check] Could not extract amount, skipping this email")
                 continue
-            amount_key = int(amount)
-            if amount_key in pending_payments:
+            amount_key = to_paise(amount)
+            entry_peek = pending_payments.get(amount_key)
+            if entry_peek:
                 # SECURITY CHECK: the email must have arrived AFTER the user picked the plan
                 # (not after the screenshot). Stops old emails from approving newer payments.
                 email_dt = get_email_datetime(msg)
-                entry_peek = pending_payments[amount_key]
                 pending_created = entry_peek.get('created_at', entry_peek['timestamp'])
                 if email_dt is not None and email_dt < (pending_created - timedelta(minutes=5)):
-                    print(f"[Gmail Check] Email for amount {amount_key} is OLDER than the pending payment "
+                    print(f"[Gmail Check] Email for ₹{fmt_amount(amount_key)} is OLDER than the pending payment "
                           f"(email: {email_dt}, pending created: {pending_created}). Skipping.")
                     continue
-                print(f"[Gmail Check] MATCH FOUND for amount {amount_key}, auto-approving")
-                entry = pending_payments.pop(amount_key)
+                entry = pending_payments.pop(amount_key, None)
+                if entry is None:
+                    continue
+                print(f"[Gmail Check] MATCH FOUND for ₹{fmt_amount(amount_key)}, auto-approving")
                 mark_email_processed(eid_str)
                 try:
                     mail.store(eid, '+FLAGS', '\\Seen')
@@ -391,18 +504,18 @@ def check_gmail_payments():
                 auto_approve(
                     entry['user_id'], entry['ch_id'], int(entry['mins']),
                     entry.get('photo_file_id'), entry.get('user_name', 'Unknown'), entry['price'],
-                    entry.get('admin_msg_id')
+                    entry.get('admin_msg_id'), amount_key
                 )
             else:
-                print(f"[Gmail Check] Amount {amount_key} extracted but no matching pending payment")
+                print(f"[Gmail Check] Amount ₹{fmt_amount(amount_key)} extracted but no matching pending payment")
         mail.logout()
         print(f"[Gmail Check] Finished successfully")
     except Exception as e:
         print(f"Gmail IMAP error: {e}")
 
-def record_payment(u_id, user_name, ch_id, mins, price):
+def record_payment(u_id, user_name, ch_id, mins, price, amount_paise=None):
     today = datetime.now().strftime("%Y-%m-%d")
-    payments_col.insert_one({
+    doc = {
         "user_id": u_id,
         "user_name": user_name,
         "channel_id": ch_id,
@@ -410,9 +523,12 @@ def record_payment(u_id, user_name, ch_id, mins, price):
         "price": int(price),
         "date": today,
         "timestamp": datetime.now()
-    })
+    }
+    if amount_paise is not None:
+        doc["amount_paise"] = int(amount_paise)
+    payments_col.insert_one(doc)
 
-def auto_approve(u_id, ch_id, mins, photo_file_id, user_name, price, admin_msg_id=None):
+def auto_approve(u_id, ch_id, mins, photo_file_id, user_name, price, admin_msg_id=None, amount_paise=None):
     try:
         expiry_datetime = datetime.now() + timedelta(minutes=mins)
         expiry_ts = int(expiry_datetime.timestamp())
@@ -422,16 +538,17 @@ def auto_approve(u_id, ch_id, mins, photo_file_id, user_name, price, admin_msg_i
             {"$set": {"expiry": expiry_datetime.timestamp()}},
             upsert=True
         )
-        record_payment(u_id, user_name, ch_id, mins, price)
+        record_payment(u_id, user_name, ch_id, mins, price, amount_paise)
         bot.send_message(u_id,
             f"🥳 Payment Verified & Approved!\n\n"
             f"Subscription: {mins} Minutes\n\n"
             f"Join Link: {link.invite_link}\n\n"
             f"⚠️ This link expires in {mins} minutes.")
+        paid_text = f"₹{price}" if amount_paise is None else f"₹{price} (paid ₹{fmt_amount(amount_paise)})"
         caption = (f"✅ Auto Verified by Bot\n\n"
                    f"User: {user_name} ({u_id})\n"
                    f"Plan: {mins} Mins\n"
-                   f"Amount: ₹{price}\n\n"
+                   f"Amount: {paid_text}\n\n"
                    f"No action needed — invite link already sent.")
         updated = False
         if admin_msg_id:
@@ -947,8 +1064,7 @@ def finalize_channel(plan_state):
         )
         summary_lines = []
         for mins, price in plans_dict.items():
-            label = f"{mins} Min" if int(mins) < 60 else f"{int(mins)//1440} Days"
-            summary_lines.append(f"• {label} — ₹{price}")
+            summary_lines.append(f"• {duration_label(mins)} — ₹{price}")
         summary = "\n".join(summary_lines)
         bot_username = bot.get_me().username
         bot.send_message(ADMIN_ID,
@@ -1117,41 +1233,69 @@ def user_pays(call):
     _, ch_id, mins = call.data.split('_')
     ch_data = channels_col.find_one({"channel_id": int(ch_id)})
     price = ch_data['plans'][mins]
-    unique_amount = get_unique_amount(price)
-    qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=upi://pay?pa={UPI_ID}%26am={unique_amount}%26cu=INR"
-    now = datetime.now()
-    pending_payments[unique_amount] = {
-        "user_id": call.from_user.id,
-        "user_name": call.from_user.first_name,
-        "ch_id": int(ch_id),
-        "mins": mins,
-        "price": price,
-        "created_at": now,
-        "timestamp": now,
-        "photo_file_id": None,
-        "admin_msg_id": None
-    }
+    unique_amount = reserve_amount(price, call.from_user.id, call.from_user.first_name, ch_id, mins)
+    if unique_amount is None:
+        bot.answer_callback_query(call.id)
+        bot.send_message(call.message.chat.id,
+            "⏳ Many payments are in progress right now. Please try again in a minute.")
+        return
+    amt_text = fmt_amount(unique_amount)
+    qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=upi://pay?pa={UPI_ID}%26am={amt_text}%26cu=INR"
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("✅ I Have Paid", callback_data=f"paid_{ch_id}_{mins}_{unique_amount}"))
-    markup.add(InlineKeyboardButton("🔙 Choose Another Plan", callback_data=f"backplans_{ch_id}"))
+    markup.add(InlineKeyboardButton("🔙 Choose Another Plan", callback_data=f"cancelpay_{ch_id}_{unique_amount}"))
     markup.add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
     bot.send_photo(call.message.chat.id, qr_url,
-        caption=(f"Plan: {mins} Minutes\n"
+        caption=(f"Plan: {duration_label(mins)}\n"
                  f"Price: ₹{price}\n"
                  f"UPI ID: {UPI_ID}\n\n"
-                 f"⚠️ Please pay exactly ₹{unique_amount} — this unique amount helps us verify your payment automatically.\n\n"
+                 f"⚠️ Please pay exactly ₹{amt_text} — this unique amount helps us verify your payment automatically. "
+                 f"[ INSTANT BOT VERIFICATION AND ENTRY ]\n\n"
                  f"After paying tap 'I Have Paid' below."),
         reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('cancelpay_'))
+def cancel_pay(call):
+    """User backed out of the payment screen without paying: free the reserved amount."""
+    parts = call.data.split('_')
+    ch_id = int(parts[1])
+    unique_amount = int(parts[2])
+    entry = pending_payments.get(unique_amount)
+    if entry and entry.get('user_id') == call.from_user.id and not entry.get('photo_file_id'):
+        pending_payments.pop(unique_amount, None)
+    bot.answer_callback_query(call.id)
+    ch_data = channels_col.find_one({"channel_id": ch_id})
+    if not ch_data:
+        bot.send_message(call.message.chat.id, "❌ Channel not found. Please use the link again.")
+        return
+    show_plan_menu(call.message.chat.id, ch_id, ch_data)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('paid_'))
 def request_proof(call):
     parts = call.data.split('_')
     ch_id = parts[1]
+    mins = parts[2]
     unique_amount = int(parts[3])
-    if unique_amount not in pending_payments:
+    user_id = call.from_user.id
+
+    if not owns_pending(unique_amount, user_id):
         bot.answer_callback_query(call.id)
-        bot.send_message(call.message.chat.id, "✅ Your payment was already verified! Check above for your invite link.")
+        recent = payments_col.find_one({
+            "user_id": user_id,
+            "amount_paise": unique_amount,
+            "timestamp": {"$gte": datetime.now() - timedelta(hours=24)}
+        })
+        if recent:
+            bot.send_message(call.message.chat.id, "✅ Your payment was already verified! Check above for your invite link.")
+            return
+        # Late payer: take the screenshot and pass it to the admin for manual approval
+        msg = bot.send_message(call.message.chat.id,
+            "📸 Please send a screenshot of your payment as proof.\n\n"
+            "The admin will verify it shortly.")
+        bot.register_next_step_handler(msg, receive_late_proof, int(ch_id), mins, unique_amount)
         return
+
+    pending_payments[unique_amount]['last_touch'] = datetime.now()
     bot.answer_callback_query(call.id)
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("🔙 Cancel / Choose Another Plan", callback_data=f"cancelproof_{ch_id}_{unique_amount}"))
@@ -1166,7 +1310,8 @@ def cancel_proof(call):
     parts = call.data.split('_')
     ch_id = int(parts[1])
     unique_amount = int(parts[2])
-    pending_payments.pop(unique_amount, None)
+    if owns_pending(unique_amount, call.from_user.id):
+        pending_payments.pop(unique_amount, None)
     bot.answer_callback_query(call.id, "Cancelled.")
     ch_data = channels_col.find_one({"channel_id": ch_id})
     if not ch_data:
@@ -1183,7 +1328,7 @@ def send_proof_to_admin(unique_amount, data):
     caption = (f"🔔 New Payment Proof (auto-check running...)\n\n"
                f"User: {data['user_name']} ({data['user_id']})\n"
                f"Plan: {data['mins']} Mins\n"
-               f"Amount to match: ₹{unique_amount} (base ₹{data['price']})\n\n"
+               f"Amount to match: ₹{fmt_amount(unique_amount)} (base ₹{data['price']})\n\n"
                f"If Gmail confirms it, this message updates automatically. "
                f"Otherwise verify the screenshot and tap Approve or Reject.")
     try:
@@ -1221,6 +1366,37 @@ def receive_proof(message, unique_amount):
     if unique_amount in pending_payments:
         pending_payments[unique_amount]['admin_msg_id'] = admin_msg_id
 
+def receive_late_proof(message, ch_id, mins, unique_amount):
+    """A buyer whose payment reservation was released still sends proof: pass it to the admin."""
+    user = message.from_user
+    if not message.photo:
+        msg = bot.send_message(message.chat.id,
+            "❌ That doesn't look like a photo. Please send a screenshot image of your payment.")
+        bot.register_next_step_handler(msg, receive_late_proof, ch_id, mins, unique_amount)
+        return
+    ch_data = channels_col.find_one({"channel_id": ch_id})
+    price = ch_data['plans'].get(str(mins), '?') if ch_data else '?'
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("✅ Approve", callback_data=f"app_{user.id}_{ch_id}_{mins}_{unique_amount}"))
+    markup.add(InlineKeyboardButton("❌ Reject", callback_data=f"rej_{user.id}_{unique_amount}"))
+    caption = (f"🔔 Payment Proof (manual check needed)\n\n"
+               f"User: {user.first_name} ({user.id})\n"
+               f"Plan: {mins} Mins\n"
+               f"Amount asked: ₹{fmt_amount(unique_amount)} (base ₹{price})\n\n"
+               f"This one is not auto-checked. Verify the screenshot and tap Approve or Reject.")
+    try:
+        bot.send_photo(ADMIN_ID, message.photo[-1].file_id, caption=caption, reply_markup=markup)
+        bot.send_message(message.chat.id,
+            "⏳ Got your screenshot!\n\n"
+            "The admin will verify it shortly and send your invite link.\n\n"
+            "Either way you're covered ❤️")
+    except Exception as e:
+        print(f"[Late Proof] Failed to notify admin: {e}")
+        bot.send_message(message.chat.id,
+            "⚠️ Something went wrong. Please contact the admin with your screenshot.",
+            reply_markup=InlineKeyboardMarkup().add(
+                InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}")))
+
 # --- MANUAL APPROVAL ---
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('app_'))
@@ -1228,13 +1404,14 @@ def approve_now(call):
     parts = call.data.split('_')
     u_id, ch_id, mins = int(parts[1]), int(parts[2]), int(parts[3])
     amount_key = int(parts[4]) if len(parts) > 4 else None
+    owns = amount_key is not None and owns_pending(amount_key, u_id)
 
     # Guard: if this payment is no longer pending, check whether it was already approved
-    if amount_key is not None and amount_key not in pending_payments:
+    if amount_key is not None and not owns:
         recent = payments_col.find_one({
             "user_id": u_id,
-            "channel_id": ch_id,
-            "timestamp": {"$gte": datetime.now() - timedelta(minutes=30)}
+            "amount_paise": amount_key,
+            "timestamp": {"$gte": datetime.now() - timedelta(hours=24)}
         })
         if recent:
             bot.answer_callback_query(call.id, "Already approved (auto-verified or approved earlier).", show_alert=True)
@@ -1254,12 +1431,19 @@ def approve_now(call):
             {"$set": {"expiry": expiry_datetime.timestamp()}},
             upsert=True
         )
-        if amount_key and amount_key in pending_payments:
-            entry = pending_payments.pop(amount_key)
-            record_payment(u_id, entry.get('user_name', 'Unknown'), ch_id, mins, entry.get('price', 0))
-        elif amount_key:
-            # Bot restarted and lost the pending entry; still record the payment
-            record_payment(u_id, "Unknown", ch_id, mins, amount_key)
+        if owns:
+            entry = pending_payments.pop(amount_key, None)
+            if entry:
+                record_payment(u_id, entry.get('user_name', 'Unknown'), ch_id, mins, entry.get('price', 0), amount_key)
+        else:
+            # Entry was released or the bot restarted; still record the payment using the plan price
+            ch_data = channels_col.find_one({"channel_id": ch_id})
+            price_val = ch_data['plans'].get(str(mins)) if ch_data else None
+            if price_val is None:
+                price_val = (amount_key // 100) if amount_key else 0
+            user_doc = all_users_col.find_one({"user_id": u_id})
+            name = user_doc.get('name', 'Unknown') if user_doc else 'Unknown'
+            record_payment(u_id, name, ch_id, mins, price_val, amount_key)
         bot.send_message(u_id,
             f"🥳 Payment Approved!\n\n"
             f"Subscription: {mins} Minutes\n\n"
@@ -1276,12 +1460,14 @@ def reject_payment(call):
     parts = call.data.split('_')
     u_id = int(parts[1])
     amount_key = int(parts[2]) if len(parts) > 2 else None
+    owns = amount_key is not None and owns_pending(amount_key, u_id)
 
-    # Guard: don't reject a payment that was already auto-approved
-    if amount_key is not None and amount_key not in pending_payments:
+    # Guard: don't reject a payment that was already approved
+    if amount_key is not None and not owns:
         recent = payments_col.find_one({
             "user_id": u_id,
-            "timestamp": {"$gte": datetime.now() - timedelta(minutes=30)}
+            "amount_paise": amount_key,
+            "timestamp": {"$gte": datetime.now() - timedelta(hours=24)}
         })
         if recent:
             bot.answer_callback_query(call.id, "This payment was already approved.", show_alert=True)
@@ -1292,7 +1478,7 @@ def reject_payment(call):
             return
 
     bot.answer_callback_query(call.id)
-    if amount_key:
+    if owns:
         pending_payments.pop(amount_key, None)
     try:
         bot.send_message(u_id,
@@ -1345,6 +1531,7 @@ if __name__ == '__main__':
     scheduler = BackgroundScheduler()
     scheduler.add_job(kick_expired_users, 'interval', minutes=1)
     scheduler.add_job(check_gmail_payments, 'interval', minutes=1)
+    scheduler.add_job(cleanup_expired_payments, 'interval', minutes=5)
     scheduler.start()
     bot.remove_webhook()
     print("Bot is running...")
